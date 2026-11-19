@@ -18,7 +18,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DATA = os.environ.get("VERA_DATA", "/config")
 KEY_FILE = os.path.join(DATA, "secret.key")
 
@@ -113,6 +113,20 @@ class Firewall(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class ApiToken(Base):
+    """Access for another app (e.g. MIRA). Created by pairing with a VERA admin login; only the hash is stored."""
+    __tablename__ = "vera_api_token"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), default="")              # e.g. "MIRA (mira.local)"
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    role: Mapped[str] = mapped_column(String(16), default="admin")         # read | write | admin (upper limit)
+    created_by: Mapped[str] = mapped_column(String(128), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    last_used: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_ip: Mapped[str] = mapped_column(String(64), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
 class AuditLog(Base):
     __tablename__ = "vera_audit"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -192,3 +206,23 @@ def user_count() -> int:
 
 def token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def instance_id() -> str:
+    """Stable id of this VERA installation (lets MIRA recognise one VERA reachable under several addresses)."""
+    p = os.path.join(DATA, "instance-id")
+    try:
+        with open(p, encoding="utf-8") as f:
+            v = f.read().strip()
+        if v:
+            return v
+    except OSError:
+        pass
+    v = secrets.token_hex(8)
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(v + "\n")
+    except OSError:
+        pass
+    return v

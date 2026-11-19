@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, select
 
 import core
-from core import AuditLog, Firewall, User, UserSession, now, session
+from core import ApiToken, AuditLog, Firewall, User, UserSession, now, session
 from wgcore.api import build_router, build_share_router
 from wgcore.models import Instance, Peer, Store
 from wgcore.service import Service
@@ -69,8 +69,10 @@ app = FastAPI(title="VERA", version=core.VERSION, docs_url=None, redoc_url=None,
 
 @app.middleware("http")
 async def protect(req: Request, call_next):
+    # CSRF: browser calls need the X-VERA header; apps with an API token (Bearer) and pairing don't use cookies
+    bearer = req.headers.get("authorization", "").startswith("Bearer ")
     if req.url.path.startswith("/api/") and req.method in ("POST", "PUT", "PATCH", "DELETE") \
-            and req.headers.get("x-vera") != "1":
+            and req.headers.get("x-vera") != "1" and not bearer and req.url.path != "/api/connect/pair":
         return JSONResponse({"detail": "Header X-VERA fehlt"}, status_code=403)
     resp = await call_next(req)
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -97,7 +99,33 @@ def client_ip(req: Request) -> str:
     return req.client.host if req.client else ""
 
 
+def _aware(t):
+    return t.replace(tzinfo=t.tzinfo or core.timezone.utc) if t else None
+
+
+def _token_user(req: Request, raw: str) -> dict:
+    """Another app (e.g. MIRA) with an API token. X-Acting-Role can only lower the token's role."""
+    with session() as s:
+        t = s.scalar(select(ApiToken).where(ApiToken.token_hash == hashlib.sha256(raw.encode()).hexdigest()))
+        if not t or not t.enabled:
+            raise HTTPException(401, "API-Schlüssel ungültig oder widerrufen")
+        level = t.role
+        acting = req.headers.get("x-acting-role", "")
+        if acting in LEVELS and LEVELS[acting] < LEVELS.get(level, 0):
+            level = acting
+        last = _aware(t.last_used)
+        if not last or (now() - last).total_seconds() > 60:
+            t.last_used, t.last_ip = now(), client_ip(req)
+        actor = (req.headers.get("x-acting-user") or "").strip()[:64]
+        name = f"{t.name} · {actor}" if actor else t.name
+        return {"id": None, "name": name, "display_name": name, "level": level, "token_id": t.id,
+                "ip": (req.headers.get("x-acting-ip") or client_ip(req))[:64]}
+
+
 def current_user(req: Request) -> dict:
+    auth = req.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return _token_user(req, auth[7:].strip())
     tok = req.cookies.get(COOKIE)
     if not tok:
         raise HTTPException(401, "nicht angemeldet")
@@ -244,6 +272,75 @@ async def my_password(req: Request, u=Depends(current_user)):
             raise HTTPException(400, "Altes Passwort stimmt nicht") from e
         usr.pw_hash = ph.hash(d["new"])
     core.audit(u["name"], "Eigenes Passwort geändert", ip=u["ip"])
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ connect (other apps, e.g. MIRA)
+@app.get("/.well-known/sysrix-app")
+def sysrix_app():
+    """Discovery: lets MIRA (and other SysriX tools) find VERA in the network."""
+    return {"app": "vera", "name": "VERA", "title": "VPN Endpoint & Remote Access", "version": core.VERSION,
+            "connect": 1, "pair": "/api/connect/pair", "instance": core.instance_id(),
+            "setup_needed": SETUP["code"] is not None}
+
+
+@app.post("/api/connect/pair")
+async def connect_pair(req: Request):
+    """One-time login of a VERA admin → API token for the calling app. The password is not stored anywhere."""
+    ip = client_ip(req)
+    if _too_many(ip):
+        raise HTTPException(429, "Zu viele Fehlversuche – bitte 10 Minuten warten")
+    d = await req.json()
+    username = (d.get("username") or "").strip()
+    with session() as s:
+        u = s.scalar(select(User).where(User.username == username))
+        ok = False
+        if u and u.enabled and u.pw_hash:
+            try:
+                ok = ph.verify(u.pw_hash, d.get("password") or "")
+            except VerifyMismatchError:
+                ok = False
+        if not ok:
+            _failed(ip)
+            core.audit(username, "App-Verbindung fehlgeschlagen", (d.get("client") or "")[:100], ok=False, ip=ip)
+            raise HTTPException(401, "Benutzer oder Passwort falsch")
+        if u.role != "admin":
+            raise HTTPException(403, "Nur ein VERA-Admin kann Apps verbinden")
+        role = d.get("role") if d.get("role") in LEVELS else "admin"
+        raw = "vera_" + core.token()
+        t = ApiToken(name=(d.get("client") or "App").strip()[:128], token_hash=hashlib.sha256(raw.encode()).hexdigest(),
+                     role=role, created_by=username, last_ip=ip)
+        s.add(t)
+        s.flush()
+        tid, tname = t.id, t.name
+    core.audit(username, "App verbunden", tname, details=f"Rolle {role}, Schlüssel #{tid}", ip=ip)
+    return {"token": raw, "token_id": tid, "role": role, "app": "vera", "name": "VERA", "version": core.VERSION}
+
+
+def token_dict(t: ApiToken) -> dict:
+    return {"id": t.id, "name": t.name, "role": t.role, "created_by": t.created_by, "enabled": t.enabled,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "last_used": t.last_used.isoformat() if t.last_used else None, "last_ip": t.last_ip}
+
+
+@app.get("/api/connect/tokens")
+def connect_tokens(u=Depends(require("admin"))):
+    with session() as s:
+        return {"tokens": [token_dict(t) for t in s.scalars(select(ApiToken).order_by(ApiToken.id))]}
+
+
+@app.delete("/api/connect/tokens/{tid}")
+def connect_token_delete(tid: int, u=Depends(current_user)):
+    """Admins revoke any key; a connected app may always revoke its own key (when it is removed there)."""
+    if LEVELS.get(u["level"], 0) < LEVELS["admin"] and u.get("token_id") != tid:
+        raise HTTPException(403, "Dafür fehlen die Rechte")
+    with session() as s:
+        t = s.get(ApiToken, tid)
+        if not t:
+            raise HTTPException(404, "Schlüssel nicht gefunden")
+        name = t.name
+        s.delete(t)
+    core.audit(u["name"], "App-Zugriff widerrufen", name, ip=u["ip"])
     return {"ok": True}
 
 

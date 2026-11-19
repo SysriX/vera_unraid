@@ -1,7 +1,8 @@
 /* WireGuard management (shared by VERA and MIRA).
- * Needs the host helpers h, leeren, api, hinweis, versuch, dialog, bestaetigen, feld, haken, eingabe,
+ * Needs the host helpers h, leeren, hinweis, versuch, dialog, bestaetigen, feld, haken, eingabe,
  * auswahl, lesenForm, tabelle, marke, punkt, datum, groesse, tabs – and window.WG_HOST:
- *   { base, shareBase, firewalls(): [{id, name}], can(level: "read"|"write"|"admin"): bool, noFirewall(el) }
+ *   { base, api(method, path, data, extra), link(path), shareUrl(token), firewalls(): [{id, name}],
+ *     can(level: "read"|"write"|"admin"): bool, noFirewall(el) }
  */
 "use strict";
 
@@ -31,7 +32,7 @@ async function wgView(main, q) {
         h("span", { class: "rechts" },
           h("button", { onclick: () => draw(true) }, "Status aktualisieren"),
           WG_HOST.can("write") ? h("button", { class: "p", title: "Instanzen und Peers der OPNsense in die Datenbank übernehmen", onclick: async () => {
-            const r = await versuch(() => api("POST", WG.url(WG.fw, "/sync")));
+            const r = await versuch(() => WG_HOST.api("POST", WG.url(WG.fw, "/sync")));
             hinweis(`Import: ${r.instances} Instanz(en), ${r.peers} Peer(s) – ${r.new} neu, ${r.missing} nicht mehr vorhanden` + (r.key_changed ? `, ${r.key_changed} mit geändertem Schlüssel` : ""));
             draw();
           } }, "Aus OPNsense importieren") : null)),
@@ -40,7 +41,7 @@ async function wgView(main, q) {
     leeren(body, h("div", { class: "leer" }, "Lädt …"));
     try {
       if (WG.tab === "sites") return await wgSites(body, draw);
-      WG.data = await api("GET", WG.url(WG.fw, `/overview?status=${withStatus ? 1 : 0}`));
+      WG.data = await WG_HOST.api("GET", WG.url(WG.fw, `/overview?status=${withStatus ? 1 : 0}`));
       const st = document.getElementById("wg-status");
       if (st) st.textContent = WG.data.status_error ? "Status nicht abrufbar: " + WG.data.status_error : "";
       if (WG.tab === "instances") wgInstances(body, draw); else wgPeers(body, draw);
@@ -51,7 +52,7 @@ async function wgView(main, q) {
 
 const wgInst = id => (WG.data.instances.find(i => i.id === id) || null);
 const wgBytes = n => n ? groesse(n) : "–";
-function wgDownload(url) { const a = h("a", { href: url, download: "" }); document.body.append(a); a.click(); a.remove(); }
+function wgDownload(url) { const a = h("a", { href: WG_HOST.link(url), download: "" }); document.body.append(a); a.click(); a.remove(); }
 async function wgCopy(text) {
   try { await navigator.clipboard.writeText(text); hinweis("In die Zwischenablage kopiert"); }
   catch { const t = h("textarea", {}, text); document.body.append(t); t.select(); document.execCommand("copy"); t.remove(); hinweis("Kopiert"); }
@@ -112,7 +113,7 @@ async function wgNewPeerDialog(redraw) {
     const i = wgInst(Number(instSel.value));
     allowed.placeholder = i.client_allowed_ips || WG.data.defaults.client_allowed_ips || "Tunnelnetz der Instanz";
     dns.placeholder = i.client_dns || WG.data.defaults.client_dns || "kein DNS";
-    try { ip.value = (await api("GET", WG.url(WG.fw, `/instances/${i.id}/next-ip`))).tunnel_address; } catch (e) { ip.value = ""; hinweis(e.message, true); }
+    try { ip.value = (await WG_HOST.api("GET", WG.url(WG.fw, `/instances/${i.id}/next-ip`))).tunnel_address; } catch (e) { ip.value = ""; hinweis(e.message, true); }
   };
   instSel.addEventListener("change", fill);
   const psk = haken("Pre-Shared Key verwenden (empfohlen)", true, null, "use_psk");
@@ -126,7 +127,7 @@ async function wgNewPeerDialog(redraw) {
   await fill();
   const res = await dialog("Neues Gerät für WireGuard", f, [["Abbrechen", null], ["Anlegen und aktivieren", async () => {
     const d = lesenForm(f); d.instance_id = Number(d.instance_id);
-    return await versuch(() => api("POST", WG.url(WG.fw, "/peers"), d), "Angelegt – auf der OPNsense aktiv");
+    return await versuch(() => WG_HOST.api("POST", WG.url(WG.fw, "/peers"), d), "Angelegt – auf der OPNsense aktiv");
   }, "p"]]);
   if (res && res.id) { await redraw(false); wgConfigDialog(res, true); }
 }
@@ -144,7 +145,7 @@ async function wgImportConfigDialog(redraw) {
     feld("Datei", datei), feld("oder Text einfügen", ta), info);
   const res = await dialog("Vorhandene Konfiguration übernehmen", f, [["Abbrechen", null],
     ["Prüfen", async () => {
-      const r = await versuch(() => api("POST", WG.url(WG.fw, "/parse-config"), { config: ta.value }));
+      const r = await versuch(() => WG_HOST.api("POST", WG.url(WG.fw, "/parse-config"), { config: ta.value }));
       const known = WG.data.peers.find(p => p.public_key === r.public_key);
       leeren(info, `Öffentlicher Schlüssel: ${r.public_key} · Adresse: ${r.tunnel_address || "–"} · AllowedIPs: ${r.client_allowed_ips || "–"} · `,
         known ? marke(`gehört zu „${known.name}“ – Schlüssel wird nachgetragen`, "ok") : marke("neu – wird auf der OPNsense angelegt", "akz"));
@@ -152,7 +153,7 @@ async function wgImportConfigDialog(redraw) {
     }],
     ["Übernehmen", async () => {
       const d = lesenForm(f); d.instance_id = Number(d.instance_id);
-      return await versuch(() => api("POST", WG.url(WG.fw, "/peers/import-config"), d));
+      return await versuch(() => WG_HOST.api("POST", WG.url(WG.fw, "/peers/import-config"), d));
     }, "p"]]);
   if (res && res.id) { hinweis(res.merged ? "Schlüssel nachgetragen" : "Übernommen und aktiviert"); await redraw(false); }
 }
@@ -189,11 +190,11 @@ async function wgPeerDialog(p, redraw) {
   if (w) {
     kn.unshift(["Löschen", async () => {
       if (!(await bestaetigen(`Zugang „${p.name}“ auf der OPNsense löschen? Das Gerät kann sich danach nicht mehr verbinden.`, "Löschen"))) return false;
-      await versuch(() => api("DELETE", WG.url(WG.fw, `/peers/${p.id}`)), "Gelöscht"); redraw(false);
+      await versuch(() => WG_HOST.api("DELETE", WG.url(WG.fw, `/peers/${p.id}`)), "Gelöscht"); redraw(false);
     }, "gefahr"]);
     if (client) kn.unshift(["Neue Schlüssel", async () => {
       if (!(await bestaetigen("Neue Schlüssel erzeugen? Die alte Konfiguration auf dem Gerät funktioniert danach nicht mehr.", "Erneuern"))) return false;
-      const r = await versuch(() => api("POST", WG.url(WG.fw, `/peers/${p.id}/rotate`)), "Neue Schlüssel aktiv");
+      const r = await versuch(() => WG_HOST.api("POST", WG.url(WG.fw, `/peers/${p.id}/rotate`)), "Neue Schlüssel aktiv");
       await redraw(false); wgConfigDialog(r, true);
     }]);
     kn.push(["Speichern", async () => {
@@ -201,14 +202,14 @@ async function wgPeerDialog(p, redraw) {
       if (schluessel) Object.assign(d, lesenForm(schluessel));
       d.instance_id = Number(d.instance_id);
       if (!d.private_key) delete d.private_key;
-      await versuch(() => api("PUT", WG.url(WG.fw, `/peers/${p.id}`), d), "Gespeichert und übernommen"); redraw(false);
+      await versuch(() => WG_HOST.api("PUT", WG.url(WG.fw, `/peers/${p.id}`), d), "Gespeichert und übernommen"); redraw(false);
     }, "p"]);
   }
   await dialog(`Zugang ${p.name}`, form, kn);
 }
 
 async function wgConfigDialog(p, reveal) {
-  const r = await versuch(() => api("GET", WG.url(WG.fw, `/peers/${p.id}/config?reveal=${reveal ? 1 : 0}`)));
+  const r = await versuch(() => WG_HOST.api("GET", WG.url(WG.fw, `/peers/${p.id}/config?reveal=${reveal ? 1 : 0}`)));
   const box = h("div", { class: "wg-config" },
     r.qr ? h("img", { src: r.qr, alt: "QR-Code", class: "wg-qr" }) : null,
     h("pre", {}, r.text));
@@ -224,10 +225,10 @@ async function wgConfigDialog(p, reveal) {
 async function wgShareDialog(p) {
   const liste = h("div", {});
   const laden = async () => {
-    const r = await api("GET", WG.url(WG.fw, `/peers/${p.id}/shares`));
+    const r = await WG_HOST.api("GET", WG.url(WG.fw, `/peers/${p.id}/shares`));
     leeren(liste, tabelle([{ t: "", w: s => punkt(s.valid ? "ok" : "") }, { t: "Erstellt", w: s => `${datum(s.created_at)} · ${s.created_by}` },
       { t: "Gültig bis", w: s => datum(s.expires_at) }, { t: "Aufrufe", w: s => `${s.uses} / ${s.max_uses || "∞"}` },
-      { t: "", w: s => h("button", { class: "klein gefahr", onclick: async () => { await api("DELETE", WG.url(WG.fw, `/peers/${p.id}/shares/${s.id}`)); laden(); } }, "Widerrufen") }],
+      { t: "", w: s => h("button", { class: "klein gefahr", onclick: async () => { await WG_HOST.api("DELETE", WG.url(WG.fw, `/peers/${p.id}/shares/${s.id}`)); laden(); } }, "Widerrufen") }],
       r.shares, { leer: "Noch keine Links" }));
   };
   const f = h("div", { class: "raster" },
@@ -240,8 +241,8 @@ async function wgShareDialog(p) {
     f, ergebnis, h("h4", {}, "Bisherige Links"), liste),
     [["Schließen", null], ["Link erzeugen", async () => {
       const d = lesenForm(f);
-      const r = await versuch(() => api("POST", WG.url(WG.fw, `/peers/${p.id}/shares`), { hours: Number(d.hours), max_uses: Number(d.max_uses) }));
-      const url = `${location.origin}${WG_HOST.shareBase}/${r.token}`;
+      const r = await versuch(() => WG_HOST.api("POST", WG.url(WG.fw, `/peers/${p.id}/shares`), { hours: Number(d.hours), max_uses: Number(d.max_uses) }));
+      const url = WG_HOST.shareUrl(r.token);
       leeren(ergebnis, h("div", { class: "karte" }, h("p", { class: "klein-t" }, `Gültig bis ${datum(r.expires_at)} – wird nur jetzt angezeigt:`),
         h("div", { class: "leiste" }, eingabe("url", url, { readonly: true, style: { flex: 1 } }), h("button", { onclick: () => wgCopy(url) }, "Kopieren"))));
       laden(); return false;
@@ -270,13 +271,13 @@ async function wgInstanceDialog(i, redraw) {
     feld("Erlaubte Netze für Geräte", eingabe("client_allowed_ips", i.client_allowed_ips, { placeholder: d.client_allowed_ips || "Tunnelnetz" }), "z. B. 192.168.0.0/24, 192.168.10.0/24 oder 0.0.0.0/0"),
     feld("Art", auswahl("role", [["clients", "Geräte (Road-Warrior)"], ["site", "Standortverbindung"]], i.role)));
   await dialog(`Instanz ${i.name}`, h("div", {}, h("p", { class: "leise klein-t" }, `${i.interface} · Port ${i.listen_port} · ${i.tunnel_address} · Schlüssel ${i.public_key}`), f),
-    [["Abbrechen", null], ["Speichern", () => versuch(() => api("PUT", WG.url(WG.fw, `/instances/${i.id}`), lesenForm(f)), "Gespeichert"), "p"]]);
+    [["Abbrechen", null], ["Speichern", () => versuch(() => WG_HOST.api("PUT", WG.url(WG.fw, `/instances/${i.id}`), lesenForm(f)), "Gespeichert"), "p"]]);
   redraw(false);
 }
 
 // ------------------------------------------------------------------ site links
 async function wgSites(el, redraw) {
-  const r = await api("GET", `${WG_HOST.base}/site-links`);
+  const r = await WG_HOST.api("GET", `${WG_HOST.base}/site-links`);
   const fwName = id => (WG_HOST.firewalls().find(f => f.id === id) || { name: `#${id}` }).name;
   const a = WG_HOST.can("admin");
   leeren(el, h("div", { class: "karte" },
@@ -291,7 +292,7 @@ async function wgSites(el, redraw) {
         a ? h("button", { class: "klein gefahr", onclick: async e => {
           e.stopPropagation();
           if (!(await bestaetigen(`Standortverbindung „${l.name}“ auf beiden OPNsense entfernen (Instanzen, Peers, angelegte Regeln)?`, "Entfernen"))) return;
-          const x = await versuch(() => api("DELETE", `${WG_HOST.base}/site-links/${l.id}`), "Entfernt");
+          const x = await versuch(() => WG_HOST.api("DELETE", `${WG_HOST.base}/site-links/${l.id}`), "Entfernt");
           if (x.warnings && x.warnings.length) hinweis(x.warnings.join("\n"), true);
           redraw(false);
         } }, "Entfernen") : null) }],
@@ -331,7 +332,7 @@ async function wgSiteWizard(redraw) {
   const res = await dialog("Neue Standortverbindung", f, [["Abbrechen", null], ["Verbinden", async () => {
     const d = lesenForm(f);
     const data = { ...d, firewall_a_id: Number(d.firewall_a_id), firewall_b_id: Number(d.firewall_b_id) };
-    return await versuch(() => api("POST", `${WG_HOST.base}/site-links`, data), "Standortverbindung steht");
+    return await versuch(() => WG_HOST.api("POST", `${WG_HOST.base}/site-links`, data), "Standortverbindung steht");
   }, "p"]]);
   if (res && res.id) { await redraw(false); wgSiteHints(res); }
 }

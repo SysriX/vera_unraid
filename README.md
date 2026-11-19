@@ -2,10 +2,11 @@
 
 # VERA
 
-**VPN Endpoint & Remote Access** – WireGuard-Verwaltung für eine oder mehrere OPNsense. Eigenständige App; derselbe Kern steckt als Modul „WireGuard“ auch in [MIRA](https://github.com/SysriX/mira_unraid).
+**VPN Endpoint & Remote Access** – WireGuard-Verwaltung für eine oder mehrere OPNsense. Eigenständige App – und über das **MIRA-Plugin** auch direkt in [MIRA](https://github.com/SysriX/mira_unraid) bedienbar.
 
 `ghcr.io/sysrix/vera:latest`
 
+> **Stand 1.1.0:** Kopplung mit MIRA (Erkennung, API-Schlüssel, Plugin) – getestet mit MIRA 0.3.0.
 > **Stand 1.0.0:** vollständig gegen eine nachgebaute OPNsense-API getestet (Import, Anlegen, Ausgabe, Standortverbindung, Entfernen). **Gegen eine echte OPNsense noch ungetestet** – vor allem die Firewall-Automation (Aliase/Regeln) und das Format von „Status“ je nach OPNsense-Version.
 
 ## Was es kann
@@ -21,6 +22,7 @@
 | **Status** | online/zuletzt online, Datenmenge, letzte Gegenstelle |
 | **Standortverbindungen** | zwei OPNsense per eigener WireGuard-Instanz koppeln, inkl. Aliasen und Firewall-Regeln (mit Sicherungspunkt) – bestehende Zugänge bleiben unberührt. Siehe [docs/SITE-TO-SITE.md](docs/SITE-TO-SITE.md) |
 | **Benutzer** | Lesen · Bearbeiten · Admin, Passwörter mit Argon2 |
+| **Verbundene Apps** | Programme wie MIRA mit eigenem API-Schlüssel (entsteht bei der Kopplung mit einem VERA-Admin), Rolle, zuletzt benutzt, sofort widerrufbar |
 | **Protokoll** | jede Änderung, jede Ausgabe einer Konfiguration, Anmeldungen |
 
 Gespeichert wird alles mit Details in **MariaDB** (oder SQLite): Tabellen `wg_instance`, `wg_peer`, `wg_site_link`, `wg_share` sowie `vera_*` für Firewalls, Benutzer und Protokoll. Private Schlüssel und API-Secrets sind mit Fernet verschlüsselt (`/config/secret.key` – **mit sichern**).
@@ -46,6 +48,15 @@ GRANT ALL ON vera.* TO 'vera'@'%';
 
 Beim ersten Start steht der **Einrichtungs-Code** im Log (und in `/config/setup-code.txt`); damit den ersten Admin anlegen.
 
+## In MIRA einbinden
+
+1. Ordner [`mira-plugin/vera/`](mira-plugin/vera) nach `/config/plugins/vera/` von MIRA kopieren.
+2. MIRA › Plugins › „Ordner neu einlesen“ → **Freigeben**.
+3. In MIRA auf **VERA** klicken: der Assistent sucht VERA im Netz (oder Adresse eingeben) und meldet sich einmal mit einem **VERA-Admin** an. VERA stellt MIRA einen eigenen Schlüssel aus – das Passwort wird nicht gespeichert.
+4. Danach stehen WireGuard, Firewalls, Benutzer und Protokoll in MIRA zur Verfügung – dieselben Seiten wie hier. Im VERA-Protokoll steht, welcher MIRA-Benutzer etwas geändert hat; widerrufen unter **Verbundene Apps**.
+
+Technik: [SysriX-Verbindungsstandard](https://github.com/SysriX/mira_unraid/blob/main/docs/PLUGINS.md) – `GET /.well-known/sysrix-app`, `POST /api/connect/pair`, danach `Authorization: Bearer …`.
+
 ## Umgebungsvariablen
 
 | Variable | Standard | Bedeutung |
@@ -63,15 +74,17 @@ Beim ersten Start steht der **Einrichtungs-Code** im Log (und in `/config/setup-
 
 - VERA kann WireGuard-Zugänge anlegen – **nur intern** erreichbar machen (z. B. HAProxy „nur intern“). Ausnahme: Pfad `/wg-share/` für Freigabelinks, falls Geräte sie von außen abholen sollen.
 - Freigabelinks enthalten den privaten Schlüssel: kurze Gültigkeit, 1× öffnen, nach Gebrauch widerrufen.
+- API-Schlüssel für Apps (MIRA) entstehen nur durch Anmeldung eines VERA-Admins, liegen nur als Hash vor und sind unter „Verbundene Apps“ widerrufbar. Die Rolle des Schlüssels ist die Obergrenze; MIRA kann sie je Benutzer nur senken.
 - Schreibende Aufrufe nur mit Header `X-VERA` (CSRF-Schutz), Cookie `HttpOnly` + `SameSite=Strict`, strenge CSP, 8 Fehlversuche in 10 Minuten → Sperre.
 
 ## Aufbau
 
 | Pfad | Inhalt |
 | --- | --- |
-| `app/wgcore/` | gemeinsamer Kern (OPNsense-API, Datenbank, Logik, Routen) – **Originalquelle**, MIRA enthält eine Kopie |
-| `app/web/wireguard.js`, `wireguard.css` | gemeinsame Oberfläche (ebenfalls in MIRA) |
-| `app/main.py`, `app/core.py` | VERA: Anmeldung, Firewalls, Benutzer, Protokoll |
+| `app/wgcore/` | Kern (OPNsense-API, Datenbank, Logik, Routen) |
+| `app/web/vera-views.js`, `wireguard.js`, `wireguard.css` | Oberfläche – von VERA selbst **und** vom MIRA-Plugin benutzt |
+| `app/main.py`, `app/core.py` | Anmeldung, Firewalls, Benutzer, Protokoll, Kopplung mit Apps |
+| `mira-plugin/vera/` | Plugin für MIRA; nach Änderungen an der Oberfläche `python tools/build_mira_plugin.py` |
 
 ```bash
 pip install -r requirements.txt

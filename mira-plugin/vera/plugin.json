@@ -1,0 +1,59 @@
+{
+  "id": "vera",
+  "name": "VERA",
+  "title": "VPN Endpoint & Remote Access",
+  "version": "1.1.0",
+  "author": "SysriX",
+  "description": "WireGuard auf der OPNsense: Zugänge, neue Geräte, Konfigurationen, Standortverbindungen – in MIRA wie direkt in VERA.",
+  "group": "Netzwerk",
+  "icon": "icon.svg",
+  "connect": {
+    "type": "sysrix",
+    "app": "vera",
+    "ports": [
+      8080,
+      443,
+      80
+    ],
+    "hostnames": [
+      "vera"
+    ],
+    "proxy": [
+      "/api/wg/",
+      "/api/firewalls",
+      "/api/users",
+      "/api/audit",
+      "/api/me"
+    ]
+  },
+  "ui": {
+    "styles": [
+      "wireguard.css"
+    ],
+    "scripts": [
+      "wireguard.js",
+      "vera-views.js",
+      "vera-plugin.js"
+    ],
+    "views": [
+      {
+        "id": "wireguard",
+        "title": "WireGuard"
+      },
+      {
+        "id": "firewalls",
+        "title": "Firewalls"
+      },
+      {
+        "id": "users",
+        "title": "Benutzer",
+        "level": "admin"
+      },
+      {
+        "id": "audit",
+        "title": "Protokoll",
+        "level": "write"
+      }
+    ]
+  }
+}
