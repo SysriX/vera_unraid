@@ -1,0 +1,7 @@
+/* VERA – small additions to base.css (MIRA layout) */
+aside .logo{flex-direction:row;align-items:center;gap:10px}
+aside .logo b{font-size:18px;letter-spacing:.18em;color:var(--akzent)}
+aside .logo small{display:none}
+.mitte .logo-gross h1{letter-spacing:.3em;color:var(--akzent);margin:8px 0 0}
+.ecke{position:fixed;top:12px;right:12px}
+details summary{cursor:pointer;color:var(--leise)}

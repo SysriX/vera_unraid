@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>VERA</Name>
+  <Repository>ghcr.io/sysrix/vera:latest</Repository>
+  <Registry>https://github.com/SysriX/vera_unraid/pkgs/container/vera</Registry>
+  <Network>br0</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/SysriX/vera_unraid/issues</Support>
+  <Project>https://github.com/SysriX/vera_unraid</Project>
+  <ReadMe>https://github.com/SysriX/vera_unraid/blob/main/README.md</ReadMe>
+  <Overview>VERA – VPN Endpoint &amp; Remote Access. WireGuard-Verwaltung für eine oder mehrere OPNsense: vorhandene Instanzen und Zugänge importieren, neue Geräte anlegen und sofort aktivieren, Konfigurationen als Text, QR-Code, Datei oder zeitlich begrenzten Freigabelink ausgeben, vorhandene .conf-Dateien übernehmen, Schlüssel erneuern und zwei OPNsense per Standortverbindung (Site-to-Site) koppeln – ohne die bestehenden Zugänge zu stören. Alles mit Details in MariaDB (oder SQLite), private Schlüssel verschlüsselt. Beim ersten Start steht ein Einrichtungs-Code im Log.</Overview>
+  <Category>Network:VPN Network:Management Tools:Security:</Category>
+  <ExtraSearchTerms>wireguard opnsense vpn site-to-site road warrior qr</ExtraSearchTerms>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/SysriX/vera_unraid/main/templates/vera.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/SysriX/vera_unraid/main/icon.png</Icon>
+  <ExtraParams>--hostname vera --log-opt max-size=10m --log-opt max-file=3</ExtraParams>
+  <PostArgs/>
+  <Requires>OPNsense mit API-Schlüssel (Rechte „VPN: WireGuard“, für Standortverbindungen zusätzlich Firewall-Regeln/Aliase). Optional MariaDB.</Requires>
+  <License>MIT</License>
+  <Config Name="Daten" Target="/config" Default="/mnt/user/appdata/vera" Mode="rw" Description="SQLite (falls keine MariaDB) und secret.key – den Schlüssel mit sichern, sonst sind gespeicherte API- und WireGuard-Schlüssel verloren!" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/vera</Config>
+  <Config Name="MariaDB-Server" Target="DB_HOST" Default="" Mode="" Description="IP/Name der MariaDB, z. B. &lt;IP_MariaDB&gt;. Leer = eingebaute SQLite." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="MariaDB-Port" Target="DB_PORT" Default="3306" Mode="" Description="Port der MariaDB." Type="Variable" Display="always" Required="false" Mask="false">3306</Config>
+  <Config Name="MariaDB-Datenbank" Target="DB_NAME" Default="vera" Mode="" Description="Datenbank (vorher anlegen)." Type="Variable" Display="always" Required="false" Mask="false">vera</Config>
+  <Config Name="MariaDB-Benutzer" Target="DB_USER" Default="vera" Mode="" Description="Benutzer mit allen Rechten auf die Datenbank." Type="Variable" Display="always" Required="false" Mask="false">vera</Config>
+  <Config Name="MariaDB-Passwort" Target="DB_PASSWORD" Default="" Mode="" Description="Passwort des Datenbank-Benutzers." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="WebUI-Port" Target="VERA_PORT" Default="8080" Mode="" Description="Port der Weboberfläche im Container." Type="Variable" Display="advanced" Required="false" Mask="false">8080</Config>
+  <Config Name="Proxy-IPs" Target="VERA_PROXY_IPS" Default="127.0.0.1" Mode="" Description="IP(s) des Reverse-Proxys, dem VERA X-Forwarded-For/-Proto glaubt, z. B. &lt;IP_HAProxy&gt;." Type="Variable" Display="always" Required="false" Mask="false">127.0.0.1</Config>
+  <Config Name="Schlüssel" Target="VERA_KEY" Default="" Mode="" Description="Optional: eigener Schlüssel (Fernet, 44 Zeichen) statt /config/secret.key." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Einrichtungs-Code" Target="VERA_SETUP_CODE" Default="" Mode="" Description="Optional: fester Code für die Ersteinrichtung. Leer = wird beim Start erzeugt und ins Log geschrieben." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Zeitzone" Target="TZ" Default="Europe/Berlin" Mode="" Description="Zeitzone." Type="Variable" Display="advanced" Required="false" Mask="false">Europe/Berlin</Config>
+</Container>
