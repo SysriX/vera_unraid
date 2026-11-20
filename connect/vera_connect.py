@@ -1028,8 +1028,8 @@ def setup(argv: list[str]) -> None:
         if not p.get("silent"):
             box(f"Installation fehlgeschlagen:\n{e}", 0x10)
         sys.exit(1)
-    start_tray()
-    if not p.get("silent"):
+    if not p.get("silent"):                     # silent (GPO/DORA/Intune): the tray starts at the next logon
+        start_tray()
         url = load("config.json").get("url")
         box("VERA-Connect ist installiert und läuft als Dienst.\n\n"
             + (f"Der Rechner meldet sich bei {url} an und erscheint dort unter „Rechner“ zur Freigabe. "
