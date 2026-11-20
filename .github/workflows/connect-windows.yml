@@ -30,6 +30,7 @@ jobs:
       - name: Kompilieren (Nuitka, eine Datei)
         shell: pwsh
         run: |
+          trap { Write-Host ("::error title=Kompilieren::" + "$_".Replace("`n",'%0A')); break }
           $v = (Select-String -Path connect/vera_connect.py -Pattern '^VERSION = "(.*)"').Matches[0].Groups[1].Value
           "VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           $env:PYTHONPATH = "connect"
@@ -38,7 +39,8 @@ jobs:
             --windows-company-name=SysriX --windows-product-name="VERA-Connect" --windows-file-description="VERA-Connect (WireGuard-Verbindung zu VERA)" `
             --windows-file-version=$v --windows-product-version=$v --output-filename=VERA-Connect-Setup.exe --output-dir=dist connect/vera_connect.py
           if (-not (Test-Path dist/VERA-Connect-Setup.exe)) { throw "VERA-Connect-Setup.exe fehlt" }
-          "{0:N1} MB" -f ((Get-Item dist/VERA-Connect-Setup.exe).Length / 1MB)
+          $mb = "{0:N1} MB" -f ((Get-Item dist/VERA-Connect-Setup.exe).Length / 1MB)
+          Write-Host "::notice title=Gebaut::VERA-Connect-Setup.exe $v, $mb"
 
       # Ein Schritt: GitHub beendet Hintergrundprozesse am Ende jedes Schritts.
       - name: Test – installieren, freigeben, WireGuard + Tunnel, Tray, entfernen
@@ -66,6 +68,7 @@ jobs:
           $env:VERA_DATA = "$PWD\cfg"; $env:VERA_PORT = "18110"; $env:VERA_SETUP_CODE = "CI-TEST"
           Start-Process python -ArgumentList 'main.py' -WorkingDirectory app -RedirectStandardOutput vera.log -RedirectStandardError vera.err -WindowStyle Hidden
           Start-Sleep 8
+          Write-Host "::notice title=Test::VERA läuft, Setup des Tests"
           python tools/connect_ci.py setup
           if ($LASTEXITCODE -ne 0) { Get-Content vera.log, vera.err; throw "VERA-Setup" }
           .\dist\VERA-Connect-Setup.exe version
@@ -73,13 +76,16 @@ jobs:
           "Setup beendet mit $($p.ExitCode)"
           Get-Content "$env:ProgramData\VERA-Connect\connect.log" -ErrorAction SilentlyContinue
           sc.exe query VeraConnect
+          Write-Host "::notice title=Test::VERA-Connect installiert, Dienst läuft"
           $out = python tools/connect_ci.py approve $env:COMPUTERNAME 2>&1 | Out-String; $out
           if ($LASTEXITCODE -ne 0) { throw "Freigabe: $out" }
+          Write-Host "::notice title=Test::Rechner in VERA freigegeben"
           $out = python tools/connect_ci.py check $env:COMPUTERNAME 2>&1 | Out-String; $out
           $ok = $LASTEXITCODE
           "--- Protokoll VERA-Connect"; Get-Content "$env:ProgramData\VERA-Connect\connect.log" -ErrorAction SilentlyContinue
           "--- Status"; Get-Content "$env:ProgramData\VERA-Connect\status.json" -ErrorAction SilentlyContinue
           if ($ok -ne 0) { throw "Kein Bericht: $out" }
+          Write-Host "::notice title=Test::Bericht mit WireGuard an VERA"
           if (-not (Test-Path "$env:ProgramFiles\WireGuard\wireguard.exe")) { throw "WireGuard nicht installiert" }
           sc.exe query 'WireGuardTunnel$CI'
           if ($LASTEXITCODE -ne 0) { throw "Tunnel-Dienst fehlt" }
@@ -88,11 +94,13 @@ jobs:
           "--- Rechte der Tunnel-Datei (nur SYSTEM/Administratoren)"
           icacls "$env:ProgramData\VERA-Connect\tunnel\CI.conf"
           if ((icacls "$env:ProgramData\VERA-Connect\tunnel\CI.conf") -match 'S-1-5-32-545|BUILTIN\\Users|VORDEFINIERT\\Benutzer') { throw "Tunnel-Datei für Benutzer lesbar" }
+          Write-Host "::notice title=Test::WireGuard installiert, Tunnel-Dienst da, Manager aus, Rechte ok"
           "--- Wiederherstellen: Tunnel-Dienst von Hand entfernen"
           & "$env:ProgramFiles\WireGuard\wireguard.exe" /uninstalltunnelservice CI
           Start-Sleep 70
           sc.exe query 'WireGuardTunnel$CI'
           if ($LASTEXITCODE -ne 0) { Get-Content "$env:ProgramData\VERA-Connect\connect.log" -Tail 15; throw "Tunnel wurde nicht wiederhergestellt" }
+          Write-Host "::notice title=Test::Tunnel nach Löschen wiederhergestellt"
           "--- Tray"
           $run = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run').'VERA-Connect'; "Autostart: $run"
           if ($run -notmatch 'vera-connect\.exe" tray') { throw "Tray-Autostart fehlt" }
@@ -100,6 +108,7 @@ jobs:
           if ($t.ExitCode -ne 0) { throw "Tray-Selbsttest" }
           "--- Apps & Features"
           Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VERA-Connect' | Select-Object DisplayName, DisplayVersion, UninstallString
+          Write-Host "::notice title=Test::Tray-Selbsttest ok"
           "--- Entfernen"
           & "$env:ProgramFiles\VERA-Connect\vera-connect.exe" uninstall /S
           Start-Sleep 5
@@ -107,7 +116,8 @@ jobs:
           if ($LASTEXITCODE -eq 0) { throw "Dienst noch da" }
           sc.exe query 'WireGuardTunnel$CI'
           if ($LASTEXITCODE -eq 0) { throw "Tunnel noch da" }
-          "Alles ok"
+          Write-Host "::notice title=Test::Entfernt – alles ok"
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
