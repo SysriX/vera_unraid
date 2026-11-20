@@ -44,6 +44,21 @@ jobs:
       - name: Test – installieren, freigeben, WireGuard + Tunnel, Tray, entfernen
         shell: pwsh
         run: |
+          # Bei einem Fehler: Protokolle als Anmerkung + Zusammenfassung (öffentlich sichtbar, Logs brauchen sonst ein Login)
+          function Diag($msg) {
+            $d = "$env:ProgramData\VERA-Connect"
+            $parts = @("FEHLER: $msg",
+              "--- connect.log", ((Get-Content "$d\connect.log" -Tail 40 -ErrorAction SilentlyContinue) -join "`n"),
+              "--- status.json", ((Get-Content "$d\status.json" -ErrorAction SilentlyContinue) -join ""),
+              "--- connect-crash.txt", ((Get-Content "$d\connect-crash.txt" -Tail 30 -ErrorAction SilentlyContinue) -join "`n"),
+              "--- connect.out", ((Get-Content "$d\connect.out" -Tail 20 -ErrorAction SilentlyContinue) -join "`n"),
+              "--- vera.err", ((Get-Content vera.err -Tail 20 -ErrorAction SilentlyContinue) -join "`n"),
+              "--- Dienste", ((sc.exe query VeraConnect) -join "`n"))
+            $body = $parts -join "`n"
+            "## VERA-Connect-Test`n" + '```' + "`n$body`n" + '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+            Write-Host ("::error title=VERA-Connect-Test::" + $body.Replace('%','%25').Replace("`r",'').Replace("`n",'%0A'))
+          }
+          trap { Diag "$_"; break }
           pip install -r requirements.txt
           New-Item -ItemType Directory -Force cfg | Out-Null
           $env:PYTHONUTF8 = "1"
@@ -58,13 +73,13 @@ jobs:
           "Setup beendet mit $($p.ExitCode)"
           Get-Content "$env:ProgramData\VERA-Connect\connect.log" -ErrorAction SilentlyContinue
           sc.exe query VeraConnect
-          python tools/connect_ci.py approve $env:COMPUTERNAME
-          if ($LASTEXITCODE -ne 0) { Get-Content "$env:ProgramData\VERA-Connect\connect.log" -ErrorAction SilentlyContinue; throw "Freigabe" }
-          python tools/connect_ci.py check $env:COMPUTERNAME
+          $out = python tools/connect_ci.py approve $env:COMPUTERNAME 2>&1 | Out-String; $out
+          if ($LASTEXITCODE -ne 0) { throw "Freigabe: $out" }
+          $out = python tools/connect_ci.py check $env:COMPUTERNAME 2>&1 | Out-String; $out
           $ok = $LASTEXITCODE
           "--- Protokoll VERA-Connect"; Get-Content "$env:ProgramData\VERA-Connect\connect.log" -ErrorAction SilentlyContinue
           "--- Status"; Get-Content "$env:ProgramData\VERA-Connect\status.json" -ErrorAction SilentlyContinue
-          if ($ok -ne 0) { Get-Content "$env:ProgramData\VERA-Connect\connect-crash.txt" -ErrorAction SilentlyContinue; throw "Kein Bericht" }
+          if ($ok -ne 0) { throw "Kein Bericht: $out" }
           if (-not (Test-Path "$env:ProgramFiles\WireGuard\wireguard.exe")) { throw "WireGuard nicht installiert" }
           sc.exe query 'WireGuardTunnel$CI'
           if ($LASTEXITCODE -ne 0) { throw "Tunnel-Dienst fehlt" }
