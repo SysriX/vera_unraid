@@ -1,101 +1,65 @@
-# VERA Connect – Windows-Client (Konzept)
+# VERA-Connect – Windows-Client
 
-> **Stand 2026-11-20: nur Konzept, nichts gebaut.** Offene Entscheidungen stehen am Ende.
+Ein Windows-Programm, das sich seine WireGuard-Konfiguration selbst von VERA holt, WireGuard installiert und aktuell hält, den Tunnel überwacht und sich selbst über [UMA](https://github.com/SysriX/uma_unraid) aktualisiert. Rechner einmal installieren und in VERA freigeben – danach kümmert sich niemand mehr darum, auch nicht nach einem Konfigurationsverlust, neuen Schlüsseln oder einem WireGuard-Update.
 
-Ein Windows-Programm, das sich seine WireGuard-Konfiguration selbst von VERA holt, WireGuard installiert und aktuell hält, den Tunnel überwacht und sich selbst aktualisiert. Ziel: Rechner einmal installieren und freigeben, danach kümmert sich niemand mehr darum, auch nicht nach einem Konfigurationsverlust, nach neuen Schlüsseln oder einem WireGuard-Update.
+> **Stand 1.0.0:** Ablauf gegen VERA 1.2 und UMA 0.1 getestet (WireGuard simuliert). Die EXE wird bei GitHub auf einem frischen Windows gebaut und dort mit echtem WireGuard getestet (Workflow „VERA-Connect Windows“, Release `connect-windows`). Im echten Netz noch nicht im Einsatz.
 
-Aufbau wie die Agenten von DORA und ALMA: Python (nur Standardbibliothek), mit Nuitka zu einer EXE übersetzt, **Windows-Dienst** (LocalSystem) plus **Tray-Programm** im Benutzerkontext.
-
-## Ablauf
-
-```
-Installation (EXE, optional mit Parametern)
-   └─ Dienst „VeraConnect“ startet
-        1. Anmeldung bei VERA  POST <VERA_EXTERN>/client/enroll
-           (Rechner-Kennung, öffentlicher Geräteschlüssel, Rechnername, Domäne, angemeldeter Benutzer, Windows-Version)
-        2. VERA kennt den Rechner nicht → Liste „Freizugebende Rechner“ → Client wartet (fragt alle 60 s nach)
-        3. Admin gibt frei und weist einen WireGuard-Zugang zu (vorhandener oder neu angelegter Peer)
-        4. Client holt die Konfiguration, speichert sie verschlüsselt zwischen
-        5. WireGuard fehlt → offizielles MSI laden, Signatur prüfen, still installieren
-        6. Tunnel als Dienst eintragen (wireguard.exe /installtunnelservice), WireGuard-Tray abschalten
-        7. Dauerbetrieb: Tunnel überwachen, Konfiguration abgleichen, Updates von WireGuard und von sich selbst
-```
-
-## Identität und Sicherheit
-
-Ein Rechnername oder eine Kennung allein reicht nicht, beides lässt sich abschreiben. Deshalb:
-
-| Baustein | Inhalt |
-| --- | --- |
-| **Rechner-Kennung** | Hash aus SMBIOS-UUID + `MachineGuid` (Registry) + Seriennummer. Bleibt bei Neuinstallation des Clients gleich, ändert sich erst bei neuer Hardware bzw. neuem Windows. Dient zur **Wiedererkennung**, nicht als Passwort |
-| **Geräteschlüssel** | Bei der Installation erzeugt der Client ein eigenes Schlüsselpaar (Ed25519). Der private Schlüssel bleibt auf dem Rechner (DPAPI, Maschinen-Kontext; wenn vorhanden im TPM). VERA merkt sich bei der Freigabe den **öffentlichen** Schlüssel |
-| **Jede Anfrage signiert** | Zeitstempel + Zufallszahl + Inhalt werden mit dem Geräteschlüssel signiert. VERA prüft Signatur, Zeitfenster (±5 min) und Wiederholung. Eine abgehörte oder kopierte Anfrage nützt nichts |
-| **Anmelde-Schlüssel (optional)** | `ENROLLKEY=` beim Installieren: nur Rechner mit diesem Schlüssel landen überhaupt in der Freigabeliste. Schützt vor fremden Einträgen über die öffentliche Adresse. Alternativ: Freigabe automatisch für Rechner einer bestimmten Domäne mit gültigem Anmelde-Schlüssel |
-| **Freigabe durch Admin** | Erst nach Freigabe gibt es eine Konfiguration. Sieht ein bekannter Rechner plötzlich einen anderen Geräteschlüssel (z. B. Festplatte geklont), landet er wieder in der Freigabeliste statt die Konfiguration zu bekommen |
-| **Sperren** | In VERA jederzeit: Rechner sperren → keine Konfiguration mehr, Client entfernt den Tunnel beim nächsten Abgleich (optional) |
-| **Öffentlich erreichbar** | Nach außen (HAProxy) nur der Pfad `/client/…` freigeben, die Weboberfläche bleibt intern – wie `/wg-share/` |
-
-Die Konfiguration enthält den privaten WireGuard-Schlüssel. Sie geht nur über HTTPS an einen freigegebenen Rechner mit passender Signatur und wird auf dem Rechner per DPAPI verschlüsselt abgelegt (`C:\ProgramData\VERA-Connect\`, nur SYSTEM und Administratoren).
-
-## In VERA (Server-Seite, Version 1.2)
-
-- Tabelle `vera_client`: Kennung, Geräteschlüssel, Rechnername, Domäne, Benutzer, Windows-Version, Client-Version, WireGuard-Version, Status (wartet · freigegeben · gesperrt), zugewiesene Peers, zuletzt gesehen, letzte IP, Tunnelstatus.
-- Seite **„Rechner“**: Freigabeliste mit allen Angaben, Freigeben (vorhandenen Zugang wählen oder „neuen Zugang für diesen Rechner anlegen“ – Name z. B. `<Rechner>_<Benutzer>`), Sperren, Verlauf.
-- Endpunkte unter `/client/` (öffentlich, signiert): `enroll`, `poll` (Status + Konfigurations-Version), `config`, `report` (Tunnelstatus, Versionen, Fehler).
-- Ändert sich ein Zugang (neue Schlüssel, andere Netze, Standortverbindung erweitert AllowedIPs), erhöht VERA die Konfigurations-Version. Der Client merkt das beim nächsten Abgleich und spielt die neue Konfiguration ein. Das Häkchen „neue Konfiguration nötig“ erledigt sich damit bei Rechnern mit Client von selbst.
-
-## Der Client im Betrieb
-
-| Aufgabe | Umsetzung |
-| --- | --- |
-| **Tunnel** | als eigener Dienst `WireGuardTunnel$<Name>` – läuft ohne angemeldeten Benutzer und ohne WireGuard-Oberfläche |
-| **WireGuard-Tray abschalten** | Dienst `WireGuardManager` beenden und deaktivieren; die Tunnel-Dienste laufen unabhängig davon weiter |
-| **Tray übernehmen** | eigenes Tray-Symbol: verbunden · getrennt · wartet auf Freigabe · Fehler; Verbinden/Trennen (wenn erlaubt), letzte Verbindung, Datenmenge, „Konfiguration neu holen“ |
-| **Überwachen** | alle 30 s: Tunnel-Dienst läuft? letzter Handshake (`wg.exe show <tunnel> latest-handshakes`) jünger als 3 min? Wenn nicht und Internet erreichbar ist → Tunnel-Dienst neu starten, mit wachsender Pause bei Dauerfehler |
-| **Konfigurations-Verlust** | Tunnel-Dienst fehlt, `.conf` gelöscht oder geändert → aus dem Zwischenspeicher wiederherstellen bzw. neu von VERA holen |
-| **WireGuard aktualisieren** | täglich die offizielle Versionsliste prüfen, MSI laden, **Authenticode-Signatur (WireGuard LLC) und SHA-256** prüfen, still installieren, Tunnel danach prüfen |
-| **Sich selbst aktualisieren** | täglich `<UPDATE_URL>/vera-connect/latest.json` lesen (Version, Adresse, SHA-256, **Ed25519-Signatur**); nur korrekt signierte Pakete werden installiert, danach Neustart des Dienstes. Eine übernommene Update-Adresse kann so keine fremde Software einschleusen |
-| **Berichten** | Tunnelstatus, Versionen und Fehler an VERA – sichtbar auf der Seite „Rechner“ |
-
-### Domänen-Administrator?
-
-Für WireGuard-Installation, -Update und Dienste ist **kein Domänen-Administrator nötig**: Der Client läuft als Dienst unter LocalSystem und hat damit auf dem Rechner bereits volle Rechte. Ein gespeichertes Domänen-Admin-Passwort auf jedem Rechner wäre dagegen ein großes Risiko – wer einen Rechner übernimmt, könnte es auslesen und hätte die ganze Domäne. Empfehlung: **nicht speichern**. Falls es doch einen Fall gibt, der es braucht (z. B. ein Rechner, auf dem der Dienst nicht als SYSTEM laufen darf), dann nur ein eigenes Konto mit lokalen Admin-Rechten über eine GPO, nie den Domänen-Admin.
+Quelltext: [`connect/`](../connect) – Python, nur Standardbibliothek, mit Nuitka zu einer EXE übersetzt (kein Python auf den Rechnern nötig).
 
 ## Installation
 
-Eine **EXE** (Setup), ohne Vorgaben – alles optional per Parameter:
+Eine Datei: **`VERA-Connect-Setup.exe`** (aus dem Release `connect-windows`). Sie ist Setup, Dienst und Tray-Programm zugleich.
 
 ```
-VeraConnect-Setup.exe                                   Fragen beim ersten Start im Tray (Adresse von VERA)
-VeraConnect-Setup.exe /S URL=https://<VERA_EXTERN> ENROLLKEY=vk_… UPDATEURL=https://<UPDATE_URL>
+VERA-Connect-Setup.exe                                  Doppelklick: fragt nach Administratorrechten und den Adressen
+VERA-Connect-Setup.exe /S URL=https://<VERA_EXTERN> UPDATEURL=https://<UPDATE_URL> [ENROLLKEY=vk_…] [UPDATEKEY=…] [TUNNEL=Name]
 ```
 
 | Parameter | Bedeutung |
 | --- | --- |
-| `URL` | öffentliche Adresse von VERA (Basis für `/client/…`) |
-| `ENROLLKEY` | Anmelde-Schlüssel aus VERA (optional, empfohlen) |
-| `UPDATEURL` | Adresse für Programm-Updates |
-| `TUNNEL` | Name des Tunnels in Windows (Standard: Standortname aus VERA) |
-| `/S` | still, ohne Fragen (für GPO, DORA oder Intune) |
+| `URL` | Adresse von VERA (von außen erreichbar, nur der Pfad `/client/` muss freigegeben sein). Ein angehängtes `/client` oder `/getconfig` wird ignoriert |
+| `UPDATEURL` | Adresse von UMA (nur `/u/` muss erreichbar sein). Leer = keine Selbst-Updates |
+| `ENROLLKEY` | Anmelde-Schlüssel aus VERA › Rechner (nur nötig, wenn dort einer erzeugt wurde) |
+| `UPDATEKEY` | öffentlicher Signaturschlüssel von UMA (UMA › Programme). Ohne: wird beim ersten Kontakt gemerkt |
+| `TUNNEL` | eigener Name des Tunnels in Windows (sonst der aus der Freigabe in VERA) |
+| `/S` | still, ohne Fragen – für GPO, DORA, Intune |
 
-Mit Parametern legt der Client nach der Installation sofort los. Verteilen lässt er sich auch über [DORA](https://github.com/SysriX/dora_unraid) als Paket.
+Ohne Parameter fragt das Setup nach den Adressen; leer lassen geht auch, dann im Tray unter **Einstellungen** nachtragen.
 
-## Update-Server
+Installiert wird nach `C:\Program Files\VERA-Connect\`, Daten in `C:\ProgramData\VERA-Connect\` (nur SYSTEM/Administratoren; die Benutzer dürfen nur Status und Protokoll lesen). Eintrag in „Apps & Features“ zum Entfernen (`vera-connect.exe uninstall [/S]`).
 
-`<UPDATE_URL>` ist eine einfache statische Ablage (z. B. nginx über MIRA oder ein kleiner Container):
+## Ablauf
 
-```
-vera-connect/latest.json              {"version", "url", "sha256", "signature", "notes"}
-vera-connect/VeraConnect-1.0.3.exe
-```
+1. Der Dienst **VeraConnect** (LocalSystem) erzeugt beim ersten Start die **Rechner-Kennung** (aus SMBIOS-UUID, MachineGuid und BIOS-Seriennummer) und einen eigenen **Geräteschlüssel** (Ed25519, per DPAPI geschützt).
+2. Er meldet sich bei VERA (`/client/enroll`) mit Rechnername, Domäne, angemeldetem Benutzer und Windows-Version. **VERA › Rechner** zeigt ihn unter „Freizugebende Rechner“; der Client fragt jede Minute nach und wartet.
+3. **Freigeben** in VERA: OPNsense und Instanz wählen → „Neuen Zugang für diesen Rechner anlegen“ (empfohlen, Schlüssel entstehen in VERA) oder einen vorhandenen Zugang mit gespeichertem privatem Schlüssel.
+4. Der Client holt die Konfiguration, speichert sie verschlüsselt zwischen, installiert bei Bedarf **WireGuard** (offizielles MSI von download.wireguard.com, Signatur „WireGuard LLC“ geprüft), richtet den **Tunnel als Dienst** ein (`WireGuardTunnel$<Name>`, ein Tunnel je Rechner, läuft schon vor der Anmeldung) und schaltet den **WireGuard-Manager/Tray** ab.
+5. Ab dann alle 30 s der **Wächter**: Tunnel weg → aus dem Zwischenspeicher wiederherstellen; kein Handshake seit 3 Minuten (und Internet da) → neu verbinden, mit wachsenden Pausen.
+6. Alle 5 Minuten Abgleich mit VERA: geänderter Zugang (neue Schlüssel, andere Netze, Standortverbindung) → neue Konfiguration wird eingespielt. Gesperrt → Tunnel wird entfernt.
+7. Täglich: neuere WireGuard-Version → still installieren. Alle 6 Stunden: neuere VERA-Connect-Version in UMA → laden, **Signatur und SHA-256 prüfen**, Dienst ersetzt sich selbst.
 
-Signiert wird beim Bauen mit einem eigenen Ed25519-Schlüssel (wie die ALMA-Lizenzen; der private Schlüssel liegt nur auf dem Bau-Rechner). Später kann auch Authenticode-Codesignierung dazukommen, damit Windows SmartScreen nicht warnt – das braucht ein gekauftes Zertifikat.
+Ist VERA nicht erreichbar, bleibt die letzte Konfiguration aktiv.
 
-## Offene Entscheidungen
+## Tray (ersetzt den von WireGuard)
 
-1. **Rechner- oder Benutzer-Tunnel?** Ein Tunnel je **Rechner** (läuft schon vor der Anmeldung, gut für Domänen-Anmeldung über VPN) oder je **Benutzer** (wechselt bei Benutzerwechsel die Konfiguration)? Vorschlag: Rechner-Tunnel, Benutzer nur zur Info in VERA.
-2. **Domänen-Admin-Zugangsdaten**: wie oben empfohlen weglassen?
-3. **Automatische Freigabe** für Rechner mit gültigem Anmelde-Schlüssel und passender Domäne – oder immer von Hand?
-4. **Update-Ablage**: eigener kleiner Container oder statische Dateien hinter nginx/HAProxy?
-5. **Darf der Benutzer** im Tray trennen, oder bleibt der Tunnel immer an (Always-on)?
-6. **Name**: „VERA Connect“ als Arbeitstitel.
+Symbol mit Statuspunkt: grün = verbunden · gelb = wartet auf Freigabe / verbindet · blau = von Hand getrennt · rot = keine Verbindung / gesperrt · grau = Dienst läuft nicht.
+
+Menü: **Verbinden / Trennen** (Trennen nur, wenn in VERA erlaubt – Schalter unter Rechner) · Konfiguration neu holen · Status · Protokoll · Einstellungen (Administrator). Von Hand getrennt bleibt der Tunnel bis „Verbinden“ oder bis zum nächsten Neustart von Windows.
+
+## Sicherheit
+
+| Baustein | Inhalt |
+| --- | --- |
+| **Signierte Anfragen** | jede Anfrage an VERA und UMA mit dem Geräteschlüssel signiert (Zeit ±5 min, Einmal-Nonce); VERA merkt sich den Schlüssel bei der Anmeldung |
+| **Freigabe von Hand** | ohne Freigabe in VERA keine Konfiguration |
+| **Geklonte Rechner** | andere Hardware-Kennung oder anderer Schlüssel → neuer Eintrag bzw. wieder „wartet auf Freigabe“ |
+| **Anmelde-Schlüssel** | optional: nur Rechner mit diesem Schlüssel erscheinen überhaupt in der Liste |
+| **Konfiguration auf dem Rechner** | Tunnel-Datei nur für SYSTEM/Administratoren lesbar, Zwischenspeicher zusätzlich DPAPI-verschlüsselt |
+| **Updates** | WireGuard nur mit gültiger Signatur von WireGuard LLC; VERA-Connect nur mit gültiger UMA-Signatur |
+| **Kein Domänen-Admin** | der Dienst läuft als SYSTEM und braucht keine gespeicherten Zugangsdaten |
+
+## VERA-Connect selbst aktualisieren (UMA)
+
+1. In UMA das Programm **`vera-connect`** anlegen (Wer bekommt Updates? → nur freigegebene Rechner oder alle).
+2. Neue `VERA-Connect-Setup.exe` als neue Version hochladen und veröffentlichen.
+3. Die Rechner fragen alle 6 Stunden nach; bei „nur freigegebene Rechner“ erscheinen sie in UMA › Rechner zur Freigabe.

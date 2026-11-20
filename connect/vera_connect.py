@@ -1,0 +1,1113 @@
+#!/usr/bin/env python3
+"""VERA-Connect – keeps the WireGuard tunnel of a Windows computer configured, connected and up to date.
+
+    VERA-Connect-Setup.exe                                         install (asks for the address of VERA)
+    VERA-Connect-Setup.exe /S URL=https://<VERA_EXTERN> ENROLLKEY=vk_… UPDATEURL=https://<UPDATE_URL> [UPDATEKEY=…] [TUNNEL=…]
+    vera-connect.exe install --url … [--enroll-key …] [--update-url …] [--update-key …] [--tunnel …] [--silent]
+    vera-connect.exe uninstall | status | version | configure | tray
+    vera-connect.exe run [--data DIR] [--simulate]              foreground (the service runs this); --simulate = no WireGuard changes
+
+What the service (LocalSystem) does:
+  1. device identity: machine id (SMBIOS UUID + MachineGuid + BIOS serial, hashed) and an Ed25519 device key (DPAPI)
+  2. POST <VERA>/client/enroll → unknown computers wait in VERA for approval (checks again every minute)
+  3. approved → fetch the configuration, keep an encrypted copy, install WireGuard if missing (official MSI, signature checked),
+     register the tunnel as a Windows service, switch off WireGuard's own tray/manager
+  4. watchdog every 30 s: tunnel missing → restore, no handshake for 3 min → restart (with growing pauses)
+  5. VERA changes the configuration (new keys, networks) → new configuration is installed automatically
+  6. daily: newer WireGuard → install; every 6 h: newer VERA-Connect in UMA (signed) → update itself
+The user may disconnect in the tray (if VERA allows it); it stays off until "Verbinden" or the next restart of Windows.
+Standard library only (+ ed25519.py). Windows: service "VeraConnect", data in C:\\ProgramData\\VERA-Connect.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import ctypes
+import hashlib
+import json
+import os
+import platform
+import re
+import secrets
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+import ed25519
+
+VERSION = "1.0.0"
+PROGRAM = "vera-connect"                         # key of the program in UMA
+APP = "VERA-Connect"
+SERVICE = "VeraConnect"
+WIN = os.name == "nt"
+NOWIN = 0x08000000 if WIN else 0
+STOP = threading.Event()
+COMPILED = "__compiled__" in globals()
+SID_SYSTEM, SID_ADMINS, SID_USERS = "*S-1-5-18", "*S-1-5-32-544", "*S-1-5-32-545"
+WATCH_EVERY, HANDSHAKE_MAX, WG_CHECK_EVERY, SELF_CHECK_EVERY = 30, 180, 24 * 3600, 6 * 3600
+WG_DOWNLOAD = "https://download.wireguard.com/windows-client/"
+POLL_MIN = 20
+if os.environ.get("VC_FAST"):                                     # tests: seconds instead of minutes/hours
+    WATCH_EVERY, SELF_CHECK_EVERY, POLL_MIN = 2, 8, 2
+
+
+def default_data() -> str:
+    return os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), APP)
+
+
+def home_dir() -> str:
+    return os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), APP)
+
+
+DATA = default_data()
+SIMULATE = False
+
+
+# ------------------------------------------------------------------ log / files
+def log(*a) -> None:
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + " ".join(str(x) for x in a)
+    try:
+        print(line, flush=True)
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        p = os.path.join(DATA, "connect.log")
+        if os.path.exists(p) and os.path.getsize(p) > 5 << 20:
+            os.replace(p, p + ".1")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def _path(name: str) -> str:
+    return os.path.join(DATA, name)
+
+
+def load(name: str) -> dict:
+    try:
+        with open(_path(name), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+SECRET = ("config.json", "device.json", "state.json")
+
+
+def _real_install() -> bool:
+    return WIN and os.path.normcase(DATA) == os.path.normcase(default_data())
+
+
+def _lock(path: str) -> None:
+    """Readable for SYSTEM and administrators only."""
+    if _real_install():
+        subprocess.run(["icacls.exe", path, "/inheritance:r", "/grant:r", f"{SID_SYSTEM}:F", f"{SID_ADMINS}:F", "/Q"],
+                       stdin=subprocess.DEVNULL, capture_output=True, creationflags=NOWIN)
+
+
+def save(name: str, data) -> None:
+    os.makedirs(DATA, exist_ok=True)
+    tmp = _path(name + ".new")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    if name in SECRET:
+        _lock(tmp)
+    os.replace(tmp, _path(name))
+
+
+def harden() -> None:
+    """Data folder: users may read status + log (tray) and drop flags into ui\\ – nothing else."""
+    if not _real_install() or not ctypes.windll.shell32.IsUserAnAdmin():
+        return
+    os.makedirs(DATA, exist_ok=True)
+    subprocess.run(["icacls.exe", DATA, "/inheritance:r", "/grant:r", f"{SID_SYSTEM}:(OI)(CI)F", f"{SID_ADMINS}:(OI)(CI)F",
+                    f"{SID_USERS}:(OI)(CI)RX", "/Q"], stdin=subprocess.DEVNULL, capture_output=True, creationflags=NOWIN)
+    for sub, users in (("ui", True), ("tunnel", False), ("update", False), ("downloads", False)):
+        d = os.path.join(DATA, sub)
+        os.makedirs(d, exist_ok=True)
+        if users:
+            subprocess.run(["icacls.exe", d, "/grant", f"{SID_USERS}:(OI)(CI)M", "/Q"], stdin=subprocess.DEVNULL, capture_output=True, creationflags=NOWIN)
+        else:
+            _lock(d)
+    for f in SECRET:
+        if os.path.exists(_path(f)):
+            _lock(_path(f))
+
+
+def run(cmd, timeout: int = 600) -> tuple[int, str]:
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, creationflags=NOWIN)
+        raw = r.stdout + b"\n" + r.stderr
+        out = raw.decode("utf-16-le", "replace") if b"\x00" in raw[:200] else raw.decode("utf-8", "replace")
+        return r.returncode, out.strip()
+    except subprocess.TimeoutExpired:
+        return -1, f"Zeitüberschreitung nach {timeout} s"
+    except OSError as e:
+        return -1, f"Start fehlgeschlagen: {e}"
+
+
+def powershell(script: str, timeout: int = 300) -> tuple[int, str]:
+    with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8-sig") as f:
+        f.write("$ProgressPreference='SilentlyContinue'\n[Console]::OutputEncoding=[Text.Encoding]::UTF8\n" + script)
+        p = f.name
+    try:
+        return run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", p], timeout)
+    finally:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------ DPAPI (keys and cached configuration)
+class _BLOB(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _dpapi(data: bytes, protect: bool) -> bytes:
+    if not WIN:
+        return data
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, dst = _BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), _BLOB()
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    ok = fn(ctypes.byref(src), "VERA-Connect" if protect else None, None, None, None, 0x1, ctypes.byref(dst))   # UI_FORBIDDEN
+    if not ok:
+        raise OSError(f"DPAPI fehlgeschlagen ({ctypes.GetLastError()})")
+    try:
+        return ctypes.string_at(dst.pbData, dst.cbData)
+    finally:
+        kernel32.LocalFree(dst.pbData)
+
+
+def protect(b: bytes) -> str:
+    return base64.b64encode(_dpapi(b, True)).decode()
+
+
+def unprotect(s: str) -> bytes:
+    return _dpapi(base64.b64decode(s), False)
+
+
+# ------------------------------------------------------------------ identity
+def machine_facts() -> dict:
+    if not WIN:
+        return {"uuid": "", "guid": socket.gethostname(), "serial": "", "hostname": socket.gethostname(), "domain": "",
+                "user": os.environ.get("USER", ""), "os": platform.platform()}
+    c, o = powershell(r"""
+$p = Get-CimInstance Win32_ComputerSystemProduct; $b = Get-CimInstance Win32_BIOS; $cs = Get-CimInstance Win32_ComputerSystem
+$os = Get-CimInstance Win32_OperatingSystem
+$g = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography').MachineGuid
+$u = $cs.UserName
+if (-not $u) { $e = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
+  if ($e) { $o = Invoke-CimMethod -InputObject $e -MethodName GetOwner; if ($o.User) { $u = "$($o.Domain)\$($o.User)" } } }
+[pscustomobject]@{uuid=$p.UUID; guid=$g; serial=$b.SerialNumber; hostname=$env:COMPUTERNAME; domain=$(if ($cs.PartOfDomain) { $cs.Domain } else { "" })
+  user=$u; os="$($os.Caption) $($os.Version)"} | ConvertTo-Json -Compress
+""", 120)
+    try:
+        return json.loads(o[o.index("{"):])
+    except ValueError:
+        log("Rechnerdaten nicht lesbar:", o[-300:])
+        return {"uuid": "", "guid": "", "serial": "", "hostname": os.environ.get("COMPUTERNAME", ""), "domain": "", "user": "", "os": platform.platform()}
+
+
+def compute_machine_id(f: dict) -> str:
+    raw = "|".join(str(f.get(k) or "").strip().upper() for k in ("uuid", "guid", "serial"))
+    return hashlib.sha256(("vera-connect|" + raw).encode()).hexdigest()
+
+
+class Device:
+    """Machine id + Ed25519 key. A different machine id (new hardware, cloned disk) creates a new key → VERA asks again."""
+
+    def __init__(self):
+        self.facts = machine_facts()
+        self.facts_at = time.time()
+        mid = compute_machine_id(self.facts)
+        d = load("device.json")
+        if d.get("machine_id") != mid or not d.get("key"):
+            if d.get("machine_id"):
+                log("Rechner-Kennung hat sich geändert (neue Hardware oder geklonter Datenträger) – neuer Geräteschlüssel, VERA fragt neu nach")
+            d = {"machine_id": mid, "key": protect(ed25519.new_secret()), "created": time.time()}
+            save("device.json", d)
+        self.machine_id = mid
+        self._secret = unprotect(d["key"])
+        self.public = base64.b64encode(ed25519.public_key(self._secret)).decode()
+
+    def refresh_facts(self) -> dict:
+        if time.time() - self.facts_at > 900:
+            self.facts, self.facts_at = machine_facts(), time.time()
+        return self.facts
+
+    def headers(self, method: str, path: str, body: bytes) -> dict:
+        ts, nonce = str(int(time.time())), secrets.token_hex(16)
+        msg = f"{method}\n{path}\n{ts}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode()
+        return {"X-Device": self.machine_id, "X-Time": ts, "X-Nonce": nonce,
+                "X-Signature": base64.b64encode(ed25519.sign(self._secret, msg)).decode()}
+
+
+class HttpError(Exception):
+    def __init__(self, status: int, detail: str):
+        super().__init__(f"HTTP {status}: {detail}")
+        self.status, self.detail = status, detail
+
+
+_ssl = ssl.create_default_context()
+
+
+def request(dev: Device, base: str, method: str, path: str, data: dict | None = None, raw: bool = False, timeout: int = 30):
+    """Signed request. path without host (signature covers it); base may carry a sub-path (https://host/vera)."""
+    from urllib.parse import urlsplit
+    full = base.rstrip("/") + path
+    body = json.dumps(data).encode() if data is not None else b""
+    req = urllib.request.Request(full, data=body if method != "GET" else None, method=method,
+                                 headers={"Content-Type": "application/json", "User-Agent": f"{APP}/{VERSION}",
+                                          **dev.headers(method, urlsplit(full).path, body)})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl) as r:
+            b = r.read()
+            return b if raw else json.loads(b or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read() or b"{}").get("detail") or e.reason
+        except (ValueError, AttributeError):
+            detail = e.reason
+        raise HttpError(e.code, str(detail)) from e
+
+
+# ------------------------------------------------------------------ status for the tray
+STATUS: dict = {"state": "start"}
+
+
+def set_status(**kw) -> None:
+    STATUS.update(kw, version=VERSION, updated=time.time(), pid=os.getpid())
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        tmp = _path("status.json.new")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(STATUS, f, ensure_ascii=False)
+        os.replace(tmp, _path("status.json"))
+    except OSError:
+        pass
+
+
+def take_flag(name: str) -> bool:
+    p = os.path.join(DATA, "ui", name)
+    if os.path.exists(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+        return True
+    return False
+
+
+# ------------------------------------------------------------------ WireGuard
+def arch() -> tuple[str, str]:
+    """(UMA arch, WireGuard MSI arch)"""
+    a = (os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE") or "AMD64").upper()
+    return ("arm64", "arm64") if "ARM" in a else ("x64", "amd64") if "64" in a else ("x86", "x86")
+
+
+def vkey(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:4]) or (0,)
+
+
+class WireGuard:
+    def __init__(self):
+        base = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WireGuard")
+        self.exe, self.wg = os.path.join(base, "wireguard.exe"), os.path.join(base, "wg.exe")
+
+    def installed(self) -> bool:
+        return SIMULATE or os.path.exists(self.exe)
+
+    def version(self) -> str:
+        if SIMULATE:
+            return "0.0-simuliert"
+        if not os.path.exists(self.exe):
+            return ""
+        import winreg
+        for root in (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",):
+            try:
+                k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+            except OSError:
+                continue
+            for i in range(10000):
+                try:
+                    sub = winreg.EnumKey(k, i)
+                except OSError:
+                    break
+                try:
+                    s = winreg.OpenKey(k, sub)
+                    if str(winreg.QueryValueEx(s, "DisplayName")[0]).startswith("WireGuard"):
+                        return str(winreg.QueryValueEx(s, "DisplayVersion")[0])
+                except OSError:
+                    continue
+        return "?"
+
+    @staticmethod
+    def latest() -> tuple[str, str]:
+        """(version, url) of the newest official MSI for this computer."""
+        with urllib.request.urlopen(urllib.request.Request(WG_DOWNLOAD, headers={"User-Agent": f"{APP}/{VERSION}"}),
+                                    timeout=30, context=_ssl) as r:
+            html = r.read().decode("utf-8", "replace")
+        _, msi_arch = arch()
+        vers = sorted(set(re.findall(rf"wireguard-{msi_arch}-(\d+(?:\.\d+)+)\.msi", html)), key=vkey)
+        if not vers:
+            raise RuntimeError("Keine WireGuard-Version auf download.wireguard.com gefunden")
+        return vers[-1], f"{WG_DOWNLOAD}wireguard-{msi_arch}-{vers[-1]}.msi"
+
+    def install(self, version: str, url: str) -> None:
+        """Download the official MSI, check its Authenticode signature (WireGuard LLC), install silently."""
+        if SIMULATE:
+            log("[simuliert] WireGuard", version, "installieren")
+            return
+        d = os.path.join(DATA, "downloads")
+        os.makedirs(d, exist_ok=True)
+        f = os.path.join(d, url.rsplit("/", 1)[-1])
+        log("Lade WireGuard", version, "…")
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": f"{APP}/{VERSION}"}), timeout=300, context=_ssl) as r, \
+                open(f, "wb") as out:
+            shutil.copyfileobj(r, out)
+        c, o = powershell(f"$s = Get-AuthenticodeSignature -LiteralPath '{f}'; \"$($s.Status)|$($s.SignerCertificate.Subject)\"", 120)
+        if not o.startswith("Valid|") or "WireGuard LLC" not in o:
+            os.remove(f)
+            raise RuntimeError(f"Signatur des WireGuard-Pakets ungültig: {o[-200:]}")
+        c, o = run(["msiexec.exe", "/i", f, "/qn", "/norestart", "DO_NOT_LAUNCH=1"], 900)
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+        if c not in (0, 3010):
+            raise RuntimeError(f"WireGuard-Installation fehlgeschlagen (Code {c}): {o[-300:]}")
+        log("WireGuard", version, "installiert")
+        self.disable_manager()
+
+    def disable_manager(self) -> None:
+        """WireGuard's own tray/manager is not needed – VERA-Connect does its job. Tunnel services keep running."""
+        if SIMULATE or not os.path.exists(self.exe):
+            return
+        c, o = run(["sc.exe", "query", "WireGuardManager"], 30)
+        if c == 0:
+            run([self.exe, "/uninstallmanagerservice"], 60)
+            log("WireGuard-Manager (Tray) abgeschaltet")
+
+    @staticmethod
+    def service(name: str) -> str:
+        return f"WireGuardTunnel${name}"
+
+    def svc_state(self, name: str) -> str:
+        if SIMULATE:
+            return STATUS.get("sim_state", "RUNNING")
+        c, o = run(["sc.exe", "query", self.service(name)], 30)
+        m = re.search(r":\s*\d\s+(STOPPED|START_PENDING|STOP_PENDING|RUNNING)", o)
+        return m.group(1) if m else "MISSING"
+
+    def conf_path(self, name: str) -> str:
+        return os.path.join(DATA, "tunnel", f"{name}.conf")
+
+    def install_tunnel(self, name: str, text: str) -> None:
+        p = self.conf_path(name)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        if self.svc_state(name) != "MISSING":
+            self.remove_tunnel(name)
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        _lock(p)
+        if SIMULATE:
+            STATUS["sim_state"] = "RUNNING"
+            log("[simuliert] Tunnel", name, "eingerichtet")
+            return
+        c, o = run([self.exe, "/installtunnelservice", p], 120)
+        if c != 0:
+            raise RuntimeError(f"Tunnel einrichten fehlgeschlagen ({c}): {o[-300:]}")
+        log("Tunnel", name, "eingerichtet")
+
+    def remove_tunnel(self, name: str) -> None:
+        if SIMULATE:
+            STATUS["sim_state"] = "MISSING"
+        elif self.svc_state(name) != "MISSING":
+            run([self.exe, "/uninstalltunnelservice", name], 120)
+            for _ in range(20):
+                if self.svc_state(name) == "MISSING":
+                    break
+                time.sleep(1)
+        try:
+            os.remove(self.conf_path(name))
+        except OSError:
+            pass
+
+    def start(self, name: str) -> None:
+        if SIMULATE:
+            STATUS["sim_state"] = "RUNNING"
+            return
+        run(["sc.exe", "start", self.service(name)], 60)
+
+    def stop(self, name: str) -> None:
+        if SIMULATE:
+            STATUS["sim_state"] = "STOPPED"
+            return
+        run(["sc.exe", "stop", self.service(name)], 60)
+
+    def stats(self, name: str) -> dict:
+        """latest handshake (unix time) and transfer of the tunnel."""
+        if SIMULATE:
+            return {"last_handshake": int(time.time()) - 20, "rx": 1234, "tx": 567}
+        out = {}
+        c, o = run([self.wg, "show", name, "latest-handshakes"], 30)
+        if c == 0:
+            hs = [int(x.split()[-1]) for x in o.splitlines() if x.strip() and x.split()[-1].isdigit()]
+            out["last_handshake"] = max(hs) if hs else 0
+        c, o = run([self.wg, "show", name, "transfer"], 30)
+        if c == 0:
+            rx = tx = 0
+            for line in o.splitlines():
+                p = line.split()
+                if len(p) >= 3 and p[-1].isdigit() and p[-2].isdigit():
+                    rx, tx = rx + int(p[-2]), tx + int(p[-1])
+            out.update(rx=rx, tx=tx)
+        return out
+
+
+# ------------------------------------------------------------------ the service loop
+def boot_time() -> int:
+    if WIN:
+        return int(time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000) // 60 * 60
+    return 0
+
+
+class Agent:
+    def __init__(self):
+        self.dev = Device()
+        self.wg = WireGuard()
+        self.state = load("state.json")
+        self.events: list[str] = []
+        self.next_poll = self.next_wg = self.next_self = 0.0
+        self.restart_pause, self.next_restart, self.tunnel_started = 60, 0.0, time.time()
+        if self.state.get("user_off") and self.state.get("user_off_boot") != boot_time():
+            self.state["user_off"] = False                     # a restart of Windows reconnects
+            log("Windows neu gestartet – Tunnel wird wieder verbunden")
+        if self.state.get("user_off") is None:
+            self.state["user_off"] = False
+
+    # ----- helpers
+    @property
+    def conf(self) -> dict:
+        return load("config.json")
+
+    def event(self, text: str) -> None:
+        log(text)
+        self.events = (self.events + [text])[-10:]
+
+    def keep(self) -> None:
+        save("state.json", self.state)
+
+    def cached_config(self) -> str:
+        try:
+            return unprotect(self.state["config"]).decode() if self.state.get("config") else ""
+        except OSError:
+            return ""
+
+    def report(self) -> dict:
+        f = self.dev.refresh_facts()
+        t = self.state.get("tunnel")
+        st = {"version": VERSION, "wg_version": self.wg.version(), "hostname": f.get("hostname"), "user": f.get("user") or "",
+              "os": f.get("os"), "user_off": bool(self.state.get("user_off")), "tunnel_state": STATUS.get("tunnel_state", "waiting")}
+        if t and STATUS.get("tunnel_state") == "up":
+            st.update(self.wg.stats(t))
+        if STATUS.get("last_error"):
+            st["error"] = STATUS["last_error"][:300]
+        return st
+
+    # ----- VERA
+    def enroll(self) -> dict:
+        c, f = self.conf, self.dev.refresh_facts()
+        r = request(self.dev, c["url"], "POST", "/client/enroll",
+                    {"machine_id": self.dev.machine_id, "public_key": self.dev.public, "hostname": f.get("hostname"),
+                     "domain": f.get("domain"), "user": f.get("user"), "os": f.get("os"), "version": VERSION,
+                     "enroll_key": c.get("enroll_key", "")})
+        self.state["enrolled"] = c["url"]
+        self.keep()
+        log("Bei VERA angemeldet – Status:", r.get("status"))
+        return r
+
+    def poll(self) -> None:
+        c = self.conf
+        if not c.get("url"):
+            set_status(state="no_url", message="Adresse von VERA fehlt – Einstellungen öffnen")
+            self.next_poll = time.time() + 60
+            return
+        try:
+            if self.state.get("enrolled") != c["url"]:
+                self.enroll()
+            try:
+                r = request(self.dev, c["url"], "POST", "/client/poll",
+                            {"config_hash": self.state.get("config_hash", ""), "report": self.report(), "events": self.events})
+            except HttpError as e:
+                if e.status != 404:
+                    raise
+                self.enroll()
+                r = request(self.dev, c["url"], "POST", "/client/poll",
+                            {"config_hash": self.state.get("config_hash", ""), "report": self.report(), "events": self.events})
+            self.events = []
+            STATUS.pop("last_error", None)
+            set_status(server_ok=time.time(), allow_disconnect=bool(r.get("allow_disconnect", True)), vera=c["url"])
+            self.next_poll = time.time() + (POLL_MIN if os.environ.get("VC_FAST") else max(POLL_MIN, int(r.get("interval") or 60)))
+            st = r.get("status")
+            if st == "pending":
+                set_status(state="pending", message="wartet auf Freigabe in VERA")
+            elif st == "blocked":
+                if self.state.get("tunnel"):
+                    self.wg.remove_tunnel(self.state["tunnel"])
+                    self.event("In VERA gesperrt – Tunnel entfernt")
+                self.state.update(tunnel=None, config=None, config_hash="")
+                self.keep()
+                set_status(state="blocked", message="in VERA gesperrt", tunnel_state="missing")
+            elif st == "no_config":
+                set_status(state="error", message=r.get("message") or "keine Konfiguration")
+            elif st == "approved":
+                if r.get("config_hash") and r["config_hash"] != self.state.get("config_hash"):
+                    self.fetch_and_apply()
+                elif STATUS.get("state") in ("pending", "start", "no_url", "offline", "error", "blocked"):
+                    set_status(state="ready", message="")
+        except HttpError as e:
+            set_status(state="error" if e.status != 403 else "denied", message=e.detail, last_error=str(e))
+            log("VERA:", e)
+            self.next_poll = time.time() + 120
+        except (OSError, ValueError) as e:                       # offline: keep using the cached configuration
+            set_status(state="offline" if not self.state.get("config") else STATUS.get("state", "offline"),
+                       message="VERA nicht erreichbar – letzte Konfiguration bleibt aktiv", last_error=str(e)[:200])
+            log("VERA nicht erreichbar:", e)
+            self.next_poll = time.time() + 120
+
+    def fetch_and_apply(self) -> None:
+        r = request(self.dev, self.conf["url"], "POST", "/client/config", {})
+        name = re.sub(r"[^A-Za-z0-9_=+.-]", "", self.conf.get("tunnel") or r.get("tunnel") or "VERA")[:32] or "VERA"
+        text = r["text"]
+        self.ensure_wireguard()
+        old = self.state.get("tunnel")
+        if old and old != name:
+            self.wg.remove_tunnel(old)
+        self.wg.install_tunnel(name, text)
+        self.state.update(tunnel=name, config=protect(text.encode()), config_hash=r["hash"])
+        self.keep()
+        self.tunnel_started, self.restart_pause = time.time(), 60
+        if self.state.get("user_off"):
+            self.wg.stop(name)
+        self.event(f"Neue Konfiguration eingerichtet (Tunnel {name})")
+        set_status(state="ready", message="", tunnel=name)
+
+    # ----- WireGuard install / update
+    def ensure_wireguard(self) -> None:
+        if self.wg.installed():
+            self.wg.disable_manager()
+            return
+        set_status(state="installing", message="WireGuard wird installiert …")
+        v, url = WireGuard.latest()
+        self.wg.install(v, url)
+        self.event(f"WireGuard {v} installiert")
+
+    def wireguard_update(self) -> None:
+        self.next_wg = time.time() + WG_CHECK_EVERY
+        if not self.wg.installed() or SIMULATE:
+            return
+        try:
+            v, url = WireGuard.latest()
+            have = self.wg.version()
+            if vkey(v) > vkey(have):
+                set_status(message=f"WireGuard {v} wird installiert …")
+                self.wg.install(v, url)
+                self.event(f"WireGuard aktualisiert: {have} → {v}")
+                t = self.state.get("tunnel")
+                if t and not self.state.get("user_off") and self.wg.svc_state(t) != "RUNNING":
+                    self.wg.start(t)
+                set_status(message="")
+        except Exception as e:  # noqa: BLE001
+            log("WireGuard-Update:", e)
+            self.next_wg = time.time() + 3600
+
+    # ----- self update through UMA
+    def self_update(self) -> None:
+        self.next_self = time.time() + SELF_CHECK_EVERY
+        c = self.conf
+        base = (c.get("update_url") or "").rstrip("/")
+        if not base:
+            return
+        try:
+            if not c.get("update_key"):                          # pin the key of this UMA on first contact
+                with urllib.request.urlopen(base + "/u/info", timeout=30, context=_ssl) as r:
+                    c["update_key"] = json.loads(r.read())["public_key"]
+                save("config.json", c)
+                log("Signaturschlüssel des Update-Servers gemerkt:", c["update_key"][:16] + "…")
+            f, uma_arch = self.dev.refresh_facts(), arch()[0]
+            r = request(self.dev, base, "POST", "/u/check", {"program": PROGRAM, "version": VERSION, "arch": uma_arch,
+                                                              "machine_id": self.dev.machine_id, "public_key": self.dev.public,
+                                                              "hostname": f.get("hostname"), "domain": f.get("domain"),
+                                                              "user": f.get("user"), "os": f.get("os")})
+            set_status(update_state=r.get("status"))
+            u = r.get("update")
+            if not u:
+                return
+            blob = request(self.dev, base, "GET", u["url"], raw=True, timeout=600)
+            sha = hashlib.sha256(blob).hexdigest()
+            msg = f"uma-release\n{PROGRAM}\n{u['version']}\n{sha}".encode()
+            if sha != u["sha256"] or not ed25519.verify(base64.b64decode(c["update_key"]), msg, base64.b64decode(u["signature"])):
+                raise RuntimeError(f"Update {u['version']} hat eine ungültige Signatur – wird nicht installiert")
+            d = os.path.join(DATA, "update")
+            os.makedirs(d, exist_ok=True)
+            new = os.path.join(d, f"vera-connect-{u['version']}.exe")
+            with open(new, "wb") as fh:
+                fh.write(blob)
+            self.event(f"VERA-Connect {u['version']} geladen und geprüft – wird installiert")
+            if SIMULATE or not COMPILED:
+                log("[simuliert/nicht kompiliert] Selbst-Update übersprungen:", new)
+                return
+            target = os.path.join(home_dir(), "vera-connect.exe")
+            subprocess.Popen([new, "upgrade", "--target", target], stdin=subprocess.DEVNULL, close_fds=True,
+                             creationflags=0x00000008 | 0x00000200 | 0x01000000 | NOWIN)   # detached, new group, breakaway
+        except HttpError as e:
+            log("Update-Server:", e)
+            set_status(update_state=f"Fehler: {e.detail}")
+            self.next_self = time.time() + 3600
+        except Exception as e:  # noqa: BLE001
+            log("Selbst-Update:", e)
+            set_status(update_state=f"Fehler: {e}")
+            self.next_self = time.time() + 3600
+
+    # ----- watchdog
+    def watch(self) -> None:
+        t = self.state.get("tunnel")
+        if not t:
+            set_status(tunnel_state="waiting")
+            return
+        if take_flag("disconnect.flag") and STATUS.get("allow_disconnect", True):
+            self.state.update(user_off=True, user_off_boot=boot_time())
+            self.keep()
+            self.wg.stop(t)
+            self.event("Vom Benutzer getrennt")
+        if take_flag("connect.flag") and self.state.get("user_off"):
+            self.state["user_off"] = False
+            self.keep()
+            self.wg.start(t)
+            self.tunnel_started, self.restart_pause = time.time(), 60
+            self.event("Vom Benutzer verbunden")
+        s = self.wg.svc_state(t)
+        if s == "MISSING":                                        # deleted by someone / config lost
+            text = self.cached_config()
+            if text:
+                try:
+                    self.ensure_wireguard()
+                    self.wg.install_tunnel(t, text)
+                    self.tunnel_started = time.time()
+                    self.event("Tunnel fehlte – aus gespeicherter Konfiguration wiederhergestellt")
+                    if self.state.get("user_off"):
+                        self.wg.stop(t)
+                except Exception as e:  # noqa: BLE001
+                    set_status(tunnel_state="missing", last_error=str(e)[:300])
+                    log("Wiederherstellen:", e)
+                    return
+            else:
+                self.state["config_hash"] = ""                    # fetch again at the next poll
+                self.next_poll = 0
+                set_status(tunnel_state="missing")
+                return
+        if self.state.get("user_off"):
+            if s == "RUNNING":
+                self.wg.stop(t)
+            set_status(tunnel_state="user_off", state="user_off")
+            return
+        if s != "RUNNING":
+            if time.time() >= self.next_restart:
+                self.wg.start(t)
+                self.tunnel_started = time.time()
+                self.event("Tunnel war aus – neu gestartet")
+                self.next_restart = time.time() + 30
+            set_status(tunnel_state="down", state="down")
+            return
+        hs = self.wg.stats(t).get("last_handshake") or 0
+        age = time.time() - hs if hs else None
+        if age is not None and age <= HANDSHAKE_MAX:
+            self.restart_pause = 60
+            set_status(tunnel_state="up", state="up", last_handshake=hs, message="")
+            return
+        set_status(tunnel_state="down", state="down", last_handshake=hs)
+        if time.time() - self.tunnel_started < HANDSHAKE_MAX or time.time() < self.next_restart:
+            return
+        if not internet_ok():
+            set_status(message="kein Internet – warte")
+            return
+        log(f"Kein Handshake seit {int(age) if age else 'Start'} s – Tunnel wird neu verbunden (nächster Versuch frühestens in {self.restart_pause // 60} min)")
+        self.wg.stop(t)
+        time.sleep(2)
+        self.wg.start(t)
+        self.tunnel_started = time.time()
+        self.next_restart = time.time() + self.restart_pause
+        self.restart_pause = min(self.restart_pause * 2, 1800)
+        self.events.append("Tunnel ohne Verbindung – neu verbunden")
+
+    def loop(self) -> None:
+        log(f"{APP} {VERSION} startet (Daten: {DATA}{', SIMULATION' if SIMULATE else ''})")
+        set_status(state="start", message="", tunnel=self.state.get("tunnel"))
+        while not STOP.is_set():
+            try:
+                if take_flag("refresh.flag"):
+                    self.state["config_hash"] = ""
+                    self.next_poll = 0
+                    log("Konfiguration neu holen (Tray)")
+                if time.time() >= self.next_poll:
+                    self.poll()
+                self.watch()
+                if time.time() >= self.next_wg and self.state.get("tunnel"):
+                    self.wireguard_update()
+                if time.time() >= self.next_self:
+                    self.self_update()
+            except Exception as e:  # noqa: BLE001 – the service must never die
+                import traceback
+                log("Fehler:", e, traceback.format_exc()[-800:])
+                set_status(last_error=str(e)[:300])
+            end = time.time() + WATCH_EVERY
+            while not STOP.is_set() and time.time() < end:
+                if any(os.path.exists(os.path.join(DATA, "ui", f)) for f in ("connect.flag", "disconnect.flag", "refresh.flag")):
+                    break
+                STOP.wait(1)
+        log(f"{APP} beendet")
+
+
+def internet_ok() -> bool:
+    for host in ("1.1.1.1", "8.8.8.8"):
+        try:
+            with socket.create_connection((host, 53), timeout=3):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+# ------------------------------------------------------------------ install / uninstall
+RUN_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+UNINSTALL_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VERA-Connect"
+
+
+def exe_path() -> str:
+    return os.path.join(home_dir(), "vera-connect.exe")
+
+
+def _reg(path: str, values: dict | None) -> None:
+    import winreg
+    if values is None:
+        try:
+            winreg.DeleteKeyEx(winreg.HKEY_LOCAL_MACHINE, path, winreg.KEY_WOW64_64KEY, 0)
+        except OSError:
+            pass
+        return
+    k = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
+    for n, v in values.items():
+        winreg.SetValueEx(k, n, 0, winreg.REG_DWORD if isinstance(v, int) else winreg.REG_SZ, v)
+    winreg.CloseKey(k)
+
+
+def tray_autostart(on: bool) -> None:
+    import winreg
+    try:
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RUN_KEY, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
+        if on:
+            winreg.SetValueEx(k, APP, 0, winreg.REG_SZ, f'"{exe_path()}" tray')
+        else:
+            try:
+                winreg.DeleteValue(k, APP)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(k)
+    except OSError as e:
+        log("Tray-Autostart:", e)
+
+
+def parse_params(argv: list[str]) -> dict:
+    """MSI-like KEY=VALUE parameters and /S (silent) – for GPO, DORA, Intune."""
+    out = {}
+    for a in argv:
+        if a.upper() in ("/S", "/SILENT", "/QUIET", "/Q", "-S"):
+            out["silent"] = True
+        elif "=" in a:
+            k, v = a.split("=", 1)
+            k = k.strip().lstrip("/-").upper()
+            if k in ("URL", "ENROLLKEY", "UPDATEURL", "UPDATEKEY", "TUNNEL"):
+                out[k] = v.strip().strip('"')
+    return out
+
+
+def ask(title: str, prompt: str, default: str = "") -> str | None:
+    """Small input box (PowerShell / VisualBasic InputBox) – None = cancelled."""
+    esc = lambda s: s.replace("'", "''")  # noqa: E731
+    c, o = powershell("Add-Type -AssemblyName Microsoft.VisualBasic\n"
+                      f"$r = [Microsoft.VisualBasic.Interaction]::InputBox('{esc(prompt)}', '{esc(title)}', '{esc(default)}')\n"
+                      "if ($r -eq '') { 'ABBRUCH' } else { 'WERT:' + $r }", 3600)
+    line = (o.strip().splitlines() or [""])[-1]
+    return line[5:].strip() if line.startswith("WERT:") else None
+
+
+def box(text: str, icon: int = 0x40) -> None:
+    if WIN:
+        ctypes.windll.user32.MessageBoxW(None, text, APP, icon)
+    else:
+        print(text)
+
+
+def normalize_url(u: str) -> str:
+    u = (u or "").strip().rstrip("/")
+    if u and not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    for suffix in ("/client", "/getconfig"):
+        if u.endswith(suffix):
+            u = u[: -len(suffix)]
+    return u
+
+
+def install(p: dict) -> None:
+    if not WIN:
+        raise SystemExit("VERA-Connect läuft nur unter Windows.")
+    import winservice
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        raise SystemExit("Bitte als Administrator ausführen.")
+    conf = load("config.json")
+    silent = p.get("silent")
+    if p.get("URL"):
+        conf["url"] = normalize_url(p["URL"])
+    elif not conf.get("url") and not silent:
+        v = ask(APP, "Adresse von VERA (z. B. https://vera.<Domain>)\nLeer lassen = später in den Einstellungen eintragen.")
+        if v is None:
+            raise SystemExit("Abgebrochen.")
+        conf["url"] = normalize_url(v)
+    if p.get("UPDATEURL"):
+        conf["update_url"] = normalize_url(p["UPDATEURL"])
+    elif "update_url" not in conf and not silent:
+        v = ask(APP, "Adresse des Update-Servers (UMA), z. B. https://update.<Domain>\nLeer = keine automatischen Updates von VERA-Connect.")
+        conf["update_url"] = normalize_url(v or "")
+    for k, n in (("ENROLLKEY", "enroll_key"), ("UPDATEKEY", "update_key"), ("TUNNEL", "tunnel")):
+        if p.get(k):
+            conf[n] = p[k]
+    if conf.get("url", "").startswith("http://"):
+        log("Achtung: VERA ohne HTTPS – nur für Tests")
+    save("config.json", conf)
+    if COMPILED:                                                   # keep a copy in Program Files
+        me, target = os.path.abspath(sys.argv[0]), exe_path()
+        if os.path.normcase(me) != os.path.normcase(target):
+            if winservice._query_state() is not None:
+                winservice.stop()
+            os.makedirs(home_dir(), exist_ok=True)
+            for _ in range(10):
+                try:
+                    shutil.copy2(me, target)
+                    break
+                except OSError:
+                    time.sleep(1)
+            sys.argv[0] = target
+    winservice.install(DATA)
+    harden()
+    tray_autostart(True)
+    _reg(UNINSTALL_KEY, {"DisplayName": APP, "DisplayVersion": VERSION, "Publisher": "SysriX",
+                         "UninstallString": f'"{exe_path()}" uninstall', "QuietUninstallString": f'"{exe_path()}" uninstall /S',
+                         "DisplayIcon": exe_path(), "InstallLocation": home_dir(), "NoModify": 1, "NoRepair": 1})
+    log(f"{APP} {VERSION} installiert – VERA: {conf.get('url') or '(fehlt)'}, Updates: {conf.get('update_url') or '(aus)'}")
+
+
+def start_tray() -> None:
+    u = os.environ.get("USERNAME", "").upper()
+    if u.endswith("$") or u == "SYSTEM" or not COMPILED:
+        return
+    try:
+        subprocess.Popen([exe_path(), "tray"], stdin=subprocess.DEVNULL, close_fds=True, creationflags=0x00000008 | 0x00000200)
+    except OSError as e:
+        log("Tray-Start:", e)
+
+
+def uninstall(silent: bool) -> None:
+    import winservice
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        raise SystemExit("Bitte als Administrator ausführen.")
+    if not silent and ctypes.windll.user32.MessageBoxW(None, "VERA-Connect entfernen? Der WireGuard-Tunnel dieses Rechners wird dabei ebenfalls entfernt. "
+                                                       "WireGuard selbst bleibt installiert.", APP, 0x34) != 6:
+        return
+    tray_autostart(False)
+    try:
+        import tray
+        tray.close_running()
+    except Exception:  # noqa: BLE001
+        pass
+    if winservice._query_state() is not None:
+        winservice.remove()
+    st = load("state.json")
+    if st.get("tunnel"):
+        WireGuard().remove_tunnel(st["tunnel"])
+    for f in ("state.json", "status.json"):
+        try:
+            os.remove(_path(f))
+        except OSError:
+            pass
+    _reg(UNINSTALL_KEY, None)
+    log(f"{APP} entfernt (Geräteschlüssel bleibt – bei Neuinstallation erkennt VERA den Rechner wieder)")
+    if COMPILED and os.path.isdir(home_dir()):
+        subprocess.Popen(f'cmd.exe /c ping -n 4 127.0.0.1 >nul & rmdir /s /q "{home_dir()}"', stdin=subprocess.DEVNULL, close_fds=True,
+                         creationflags=0x00000008 | NOWIN)
+    if not silent:
+        box("VERA-Connect wurde entfernt.")
+
+
+def upgrade(target: str) -> None:
+    """Run from the downloaded new exe: stop the service, replace the installed exe, start the service."""
+    import winservice
+    log(f"Selbst-Update auf {VERSION}: ersetze {target}")
+    winservice.stop()
+    me = os.path.abspath(sys.argv[0])
+    for _ in range(30):
+        try:
+            shutil.copy2(me, target)
+            break
+        except OSError:
+            time.sleep(1)
+    else:
+        log("Selbst-Update: Datei blieb gesperrt – alte Version läuft weiter")
+    _reg(UNINSTALL_KEY, {"DisplayVersion": VERSION})
+    winservice.start()
+    log("Selbst-Update fertig")
+
+
+def configure() -> None:
+    """Settings (admin, from the tray): addresses of VERA and UMA."""
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        elevate(["configure"])
+        return
+    conf = load("config.json")
+    v = ask(APP, "Adresse von VERA", conf.get("url", ""))
+    if v is None:
+        return
+    u = ask(APP, "Adresse des Update-Servers (UMA) – leer = keine Updates", conf.get("update_url", ""))
+    if u is None:
+        return
+    conf["url"], new_update = normalize_url(v), normalize_url(u)
+    if new_update != conf.get("update_url"):
+        conf.pop("update_key", None)                     # different UMA → pin its key again
+    conf["update_url"] = new_update
+    save("config.json", conf)
+    st = load("state.json")
+    st.pop("enrolled", None)
+    save("state.json", st)
+    os.makedirs(os.path.join(DATA, "ui"), exist_ok=True)
+    open(os.path.join(DATA, "ui", "refresh.flag"), "w").close()
+    box("Gespeichert – VERA-Connect meldet sich gleich bei der neuen Adresse.")
+
+
+def elevate(args: list[str]) -> bool:
+    exe = os.path.abspath(sys.argv[0]) if COMPILED else sys.executable
+    params = subprocess.list2cmdline(args if COMPILED else [os.path.abspath(__file__), *args])
+    return ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1) > 32
+
+
+def setup(argv: list[str]) -> None:
+    """Double-click / setup parameters: elevate, install, start the tray."""
+    p = parse_params(argv)
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        if not elevate(argv):
+            box("Für die Installation werden Administratorrechte gebraucht.", 0x10)
+        return
+    try:
+        install(p)
+    except SystemExit as e:
+        if not p.get("silent") and str(e) != "Abgebrochen.":
+            box(f"Installation fehlgeschlagen:\n{e}", 0x10)
+        return
+    except Exception as e:  # noqa: BLE001
+        log("Installation:", e)
+        if not p.get("silent"):
+            box(f"Installation fehlgeschlagen:\n{e}", 0x10)
+        sys.exit(1)
+    start_tray()
+    if not p.get("silent"):
+        url = load("config.json").get("url")
+        box("VERA-Connect ist installiert und läuft als Dienst.\n\n"
+            + (f"Der Rechner meldet sich bei {url} an und erscheint dort unter „Rechner“ zur Freigabe. "
+               "Danach richtet sich die VPN-Verbindung von selbst ein." if url else
+               "Die Adresse von VERA fehlt noch – Rechtsklick auf das Symbol in der Taskleiste › Einstellungen."))
+
+
+def main() -> None:
+    global DATA, SIMULATE
+    argv = sys.argv[1:]
+    if not argv or argv[0].startswith("/") or "=" in argv[0]:
+        if WIN:
+            setup(argv)
+            return
+    ap = argparse.ArgumentParser(description=APP)
+    sub = ap.add_subparsers(dest="cmd")
+    i = sub.add_parser("install", help="installieren und als Dienst starten")
+    for n in ("url", "enroll-key", "update-url", "update-key", "tunnel"):
+        i.add_argument("--" + n, default="")
+    i.add_argument("--silent", action="store_true")
+    r = sub.add_parser("run", help="im Vordergrund laufen")
+    r.add_argument("--data", default="")
+    r.add_argument("--simulate", action="store_true", help="WireGuard nicht anfassen (Test)")
+    r.add_argument("--service", action="store_true", help=argparse.SUPPRESS)
+    u = sub.add_parser("uninstall")
+    u.add_argument("--silent", action="store_true")
+    sub.add_parser("status")
+    sub.add_parser("version")
+    sub.add_parser("configure")
+    g = sub.add_parser("upgrade", help=argparse.SUPPRESS)
+    g.add_argument("--target", required=True)
+    t = sub.add_parser("tray")
+    t.add_argument("--data", default="")
+    t.add_argument("--selbsttest", type=float, default=0, help=argparse.SUPPRESS)
+    if argv[0] == "uninstall":                                   # also "uninstall /S" (Apps & Features, quiet)
+        argv = ["uninstall"] + ["--silent" if x.upper() in ("/S", "/SILENT", "/QUIET") else x for x in argv[1:]]
+    a = ap.parse_args(argv)
+    if a.cmd == "install":
+        p = {"URL": a.url, "ENROLLKEY": a.enroll_key, "UPDATEURL": a.update_url, "UPDATEKEY": a.update_key, "TUNNEL": a.tunnel,
+             "silent": a.silent}
+        install({k: v for k, v in p.items() if v})
+        print(f"{APP} installiert.")
+    elif a.cmd == "uninstall":
+        uninstall(a.silent)
+    elif a.cmd == "status":
+        import winservice
+        print(winservice.status())
+        print(json.dumps(load("status.json"), indent=2, ensure_ascii=False))
+    elif a.cmd == "version":
+        print(VERSION)
+    elif a.cmd == "configure":
+        configure()
+    elif a.cmd == "upgrade":
+        upgrade(a.target)
+    elif a.cmd == "tray":
+        import tray
+        sys.exit(tray.run(a.data or DATA, a.selbsttest))
+    elif a.cmd == "run":
+        DATA = a.data or DATA
+        SIMULATE = a.simulate
+        if WIN and a.service:
+            import winservice
+            try:
+                sys.stdout = sys.stderr = open(_path("connect.out"), "a", encoding="utf-8", buffering=1)
+                winservice.run_as_service(lambda: Agent().loop(), STOP)
+            except BaseException:
+                import traceback
+                with open(_path("connect-crash.txt"), "a", encoding="utf-8") as f:
+                    f.write(time.strftime("%Y-%m-%d %H:%M:%S\n") + traceback.format_exc() + "\n")
+                raise
+        else:
+            try:
+                Agent().loop()
+            except KeyboardInterrupt:
+                STOP.set()
+    else:
+        ap.print_help()
+
+
+if __name__ == "__main__":
+    main()

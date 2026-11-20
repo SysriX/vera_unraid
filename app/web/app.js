@@ -13,6 +13,7 @@ Object.assign(ANSICHT, VERA.views);
 
 const NAV = [
   ["wireguard", "WireGuard"],
+  ["clients", "Rechner"],
   ["firewalls", "Firewalls"],
   ["users", "Benutzer", "admin"],
   ["tokens", "Verbundene Apps", "admin"],

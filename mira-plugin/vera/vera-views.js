@@ -134,6 +134,110 @@ function veraViews(ctx) {
       d.tokens, { leer: "Noch keine App verbunden" })));
   } };
 
+  // ---------------------------------------------------------------- VERA-Connect computers
+  const CLIENT_STATE = { pending: ["wartet auf Freigabe", "warn"], approved: ["freigegeben", "ok"], blocked: ["gesperrt", "bad"] };
+  const TUNNEL_STATE = { up: ["verbunden", "ok"], down: ["keine Verbindung", "bad"], user_off: ["vom Benutzer getrennt", "warn"],
+    missing: ["Tunnel fehlt", "bad"], installing: ["wird eingerichtet", "warn"], waiting: ["wartet", "warn"] };
+
+  async function approveDialog(c) {
+    await loadFirewalls();
+    const fws = st.firewalls.filter(f => f.enabled);
+    if (!fws.length) { hinweis("Erst eine OPNsense unter „Firewalls“ anlegen", true); return; }
+    const body = h("div", {});
+    const fwSel = auswahl("firewall_id", fws.map(f => [f.id, f.name]), c.firewall_id || fws[0].id);
+    const mode = auswahl("mode", [["new", "Neuen Zugang für diesen Rechner anlegen (empfohlen)"], ["existing", "Vorhandenen Zugang verwenden"]], "new");
+    const draw = async () => {
+      const ov = await ctx.api("GET", `/api/wg/${fwSel.value}/overview?status=0`);
+      const inst = ov.instances.filter(i => i.role === "clients" && i.present);
+      const peers = ov.peers.filter(p => p.kind !== "site");
+      const fw = st.firewalls.find(f => f.id === Number(fwSel.value)) || {};
+      if (mode.value === "new") {
+        leeren(body, h("div", { class: "raster" },
+          feld("Instanz", auswahl("instance_id", inst.map(i => [i.id, `${i.name} (${i.tunnel_address})`]), inst[0] && inst[0].id)),
+          feld("Name des Zugangs", eingabe("name", c.hostname)),
+          feld("Besitzer", eingabe("owner", c.username)),
+          feld("Tunnel-IP", eingabe("tunnel_address", "", { placeholder: "leer = nächste freie" })),
+          feld("Name des Tunnels in Windows", eingabe("tunnel", c.tunnel || fw.site_name || fw.name || "VERA"), "Buchstaben, Ziffern, - _ . = +; max. 32")));
+      } else {
+        const ok = peers.filter(p => p.has_private_key);
+        leeren(body, h("div", { class: "raster" },
+          feld("Zugang", auswahl("peer_id", ok.map(p => [p.id, `${p.name} (${p.tunnel_address})`]), c.peer_id),
+            ok.length < peers.length ? `${peers.length - ok.length} Zugänge ohne gespeicherten privaten Schlüssel sind nicht wählbar` : null),
+          feld("Name des Tunnels in Windows", eingabe("tunnel", c.tunnel || fw.site_name || fw.name || "VERA"))));
+      }
+    };
+    fwSel.addEventListener("change", draw); mode.addEventListener("change", draw);
+    await draw();
+    const f = h("div", {},
+      h("p", { class: "klein-t" }, h("b", {}, c.hostname), ` · ${c.domain || "keine Domäne"} · angemeldet: ${c.username || "–"} · ${c.os}`),
+      h("p", { class: "leise klein-t" }, `Rechner-Kennung ${c.machine_id.slice(0, 16)}… · Geräteschlüssel ${c.key_fingerprint} · zuerst gesehen ${datum(c.first_seen)} von ${c.last_ip}`),
+      h("div", { class: "raster" }, feld("OPNsense", fwSel), feld("Zugang", mode)), body);
+    const r = await dialog(`${c.hostname || "Rechner"} freigeben`, f, [["Abbrechen", null],
+      ["Freigeben", () => versuch(() => ctx.api("POST", `/api/clients/${c.id}/approve`, { ...lesenForm(f), firewall_id: Number(fwSel.value), mode: mode.value }), "Freigegeben – der Rechner holt sich die Konfiguration gleich"), "p"]]);
+    if (r) ctx.rerender();
+  }
+
+  function clientDetails(c) {
+    const rep = c.report || {};
+    const ts = c.status !== "approved" ? ["–", ""] : TUNNEL_STATE[rep.tunnel_state] || [rep.tunnel_state || "–", ""];
+    const a = ctx.can("admin");
+    const kn = [["Schließen", null]];
+    if (a && c.status !== "approved") kn.unshift(["Freigeben …", () => { approveDialog(c); return true; }, "p"]);
+    if (a && c.status === "approved") kn.unshift(["Zuordnung ändern …", () => { approveDialog(c); return true; }]);
+    if (a && c.status !== "blocked") kn.unshift(["Sperren", async () => {
+      if (!(await bestaetigen(`${c.hostname} sperren? Der Rechner bekommt keine Konfiguration mehr und entfernt seinen Tunnel.`, "Sperren"))) return false;
+      await versuch(() => ctx.api("POST", `/api/clients/${c.id}/block`), "Gesperrt"); ctx.rerender();
+    }, "gefahr"]);
+    if (a) kn.unshift(["Entfernen", async () => {
+      if (!(await bestaetigen(`${c.hostname} aus der Liste entfernen? Meldet er sich wieder, steht er erneut zur Freigabe an. Der WireGuard-Zugang bleibt bestehen.`, "Entfernen"))) return false;
+      await versuch(() => ctx.api("DELETE", `/api/clients/${c.id}`), "Entfernt"); ctx.rerender();
+    }, "gefahr"]);
+    dialog(`Rechner ${c.hostname}`, h("div", {},
+      h("div", { class: "raster" },
+        feld("Status", h("div", {}, marke(...CLIENT_STATE[c.status]), c.note ? h("div", { class: "klein-t" }, c.note) : null)),
+        feld("Tunnel", h("div", {}, marke(...ts), rep.last_handshake ? h("div", { class: "klein-t leise" }, "letzter Handshake " + datum(new Date(rep.last_handshake * 1000).toISOString())) : null)),
+        feld("Benutzer", h("div", {}, c.username || "–")), feld("Domäne", h("div", {}, c.domain || "–")),
+        feld("Windows", h("div", {}, c.os || "–")), feld("Versionen", h("div", {}, `VERA-Connect ${c.client_version || "?"} · WireGuard ${c.wg_version || "–"}`)),
+        feld("WireGuard-Zugang", h("div", {}, c.peer_name || "–", c.tunnel ? ` · Tunnel „${c.tunnel}“` : "")),
+        feld("Zuletzt gemeldet", h("div", {}, `${datum(c.last_seen)} · ${c.last_ip}`))),
+      rep.rx !== undefined ? h("p", { class: "klein-t leise" }, `Daten: ↓ ${groesse(rep.rx || 0)} · ↑ ${groesse(rep.tx || 0)}`) : null,
+      rep.error ? h("pre", {}, rep.error) : null,
+      h("p", { class: "leise klein-t" }, `Kennung ${c.machine_id} · Geräteschlüssel ${c.key_fingerprint}` + (c.approved_by ? ` · freigegeben von ${c.approved_by} am ${datum(c.approved_at)}` : "")),
+      h("h4", {}, "Verlauf"),
+      tabelle([{ t: "Zeit", w: x => datum(x.t) }, { t: "Ereignis", w: x => x.e }], c.history.slice(0, 15), { leer: "–" })), kn);
+  }
+
+  views.clients = { titel: "Rechner", zeigen: async main => {
+    const d = await ctx.api("GET", "/api/clients");
+    const a = ctx.can("admin");
+    const pending = d.clients.filter(c => c.status === "pending");
+    const keyLine = a ? h("div", { class: "leiste" },
+      h("span", { class: "klein-t" }, "Anmelde-Schlüssel: ", d.enroll_key ? h("code", {}, d.enroll_key) : h("span", { class: "leise" }, "keiner (jeder Rechner kann sich zur Freigabe melden)")),
+      h("button", { class: "klein", onclick: async () => { await versuch(() => ctx.api("PUT", "/api/clients/settings", { enroll_key: "new" }), "Neuer Anmelde-Schlüssel"); ctx.rerender(); } }, d.enroll_key ? "Neu erzeugen" : "Erzeugen"),
+      d.enroll_key ? h("button", { class: "klein", onclick: async () => { await versuch(() => ctx.api("PUT", "/api/clients/settings", { enroll_key: "" }), "Anmelde-Schlüssel entfernt"); ctx.rerender(); } }, "Entfernen") : null,
+      haken("Benutzer darf den Tunnel trennen", d.allow_disconnect, null, "allow_disconnect").el) : null;
+    if (keyLine) keyLine.querySelector("input[type=checkbox]").addEventListener("change", async e => {
+      await versuch(() => ctx.api("PUT", "/api/clients/settings", { allow_disconnect: e.target.checked }), "Gespeichert");
+    });
+    const cols = [
+      { t: "", w: c => punkt(CLIENT_STATE[c.status][1]) },
+      { t: "Rechner", w: c => h("div", {}, h("b", {}, c.hostname || c.machine_id.slice(0, 12)), h("div", { class: "leise klein-t" }, c.domain || "")) },
+      { t: "Benutzer", w: c => c.username || "–" },
+      { t: "Status", w: c => h("div", {}, marke(...CLIENT_STATE[c.status]), c.note ? h("div", { class: "klein-t" }, c.note) : null) },
+      { t: "Tunnel", w: c => c.status === "approved" ? marke(...(TUNNEL_STATE[(c.report || {}).tunnel_state] || ["–", ""])) : "" },
+      { t: "Zugang", w: c => c.peer_name || "–" },
+      { t: "Versionen", w: c => h("span", { class: "klein-t" }, `${c.client_version || "?"} · WG ${c.wg_version || "–"}`) },
+      { t: "Zuletzt", w: c => h("span", { class: "klein-t" }, datum(c.last_seen), h("div", { class: "leise" }, c.last_ip)) },
+      { t: "", w: c => a && c.status === "pending" ? h("button", { class: "p klein", onclick: e => { e.stopPropagation(); approveDialog(c); } }, "Freigeben") : "" }];
+    leeren(main,
+      pending.length ? h("div", { class: "karte" }, h("h2", {}, `Freizugebende Rechner (${pending.length})`),
+        h("p", { class: "leise klein-t" }, "Diese Rechner haben VERA-Connect installiert und warten. Nach der Freigabe holen sie sich ihre WireGuard-Konfiguration und verbinden sich."),
+        tabelle(cols, pending, { klick: clientDetails })) : null,
+      h("div", { class: "karte" }, h("h2", {}, "Rechner mit VERA-Connect"),
+        h("p", { class: "leise klein-t" }, "Windows-Rechner holen sich ihre Konfiguration selbst, halten den Tunnel aufrecht und aktualisieren WireGuard. Von außen muss nur der Pfad /client/ erreichbar sein."),
+        keyLine, tabelle(cols, d.clients.filter(c => c.status !== "pending"), { klick: clientDetails, leer: "Noch keine Rechner" })));
+  } };
+
   views.audit = { titel: "Protokoll", level: "write", zeigen: async main => {
     const d = await ctx.api("GET", "/api/audit?limit=500");
     leeren(main, h("div", { class: "karte" }, tabelle([

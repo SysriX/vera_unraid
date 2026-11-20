@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, select
 
+import clients
 import core
 from core import ApiToken, AuditLog, Firewall, User, UserSession, now, session
 from wgcore.api import build_router, build_share_router
@@ -81,7 +82,7 @@ async def protect(req: Request, call_next):
     resp.headers.setdefault("Content-Security-Policy",
                             "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
                             "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'")
-    if req.url.path.startswith("/api/") or req.url.path.startswith("/wg-share/"):
+    if req.url.path.startswith("/api/") or req.url.path.startswith(("/wg-share/", "/client/")):
         resp.headers.setdefault("Cache-Control", "no-store")
     elif req.url.path.startswith("/static/"):
         resp.headers.setdefault("Cache-Control", "no-cache")
@@ -568,6 +569,8 @@ class Host:
 _host = Host()
 app.include_router(build_router(_host, "/api/wg"))
 app.include_router(build_share_router(_host, "/wg-share", "VERA"))
+app.include_router(clients.build_public_router(_host))              # VERA-Connect (public, signed)
+app.include_router(clients.build_admin_router(_host, store))
 
 
 @app.get("/health")
