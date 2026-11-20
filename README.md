@@ -94,5 +94,6 @@ VERA_DATA=./daten python app/main.py
 ## Geplant
 
 - Zugriffsregeln je Standortverbindung (z. B. nur ein Rechner auf bestimmte Netze der Gegenseite).
+- Windows-Client „VERA Connect“ (Konfiguration selbst holen, Freigabe, Tunnel überwachen, Updates) – Konzept in [docs/WINDOWS-CLIENT.md](docs/WINDOWS-CLIENT.md).
 
 Lizenz: MIT
