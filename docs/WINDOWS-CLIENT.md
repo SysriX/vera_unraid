@@ -2,6 +2,7 @@
 
 Ein Windows-Programm, das sich seine WireGuard-Konfiguration selbst von VERA holt, WireGuard installiert und aktuell hält, den Tunnel überwacht und sich selbst über [UMA](https://github.com/SysriX/uma_unraid) aktualisiert. Rechner einmal installieren und in VERA freigeben – danach kümmert sich niemand mehr darum, auch nicht nach einem Konfigurationsverlust, neuen Schlüsseln oder einem WireGuard-Update.
 
+> **Stand 1.1.0:** WireGuard kommt aus UMA (Komponente), sonst vom Hersteller.
 > **Stand 1.0.0:** Ablauf gegen VERA 1.2 und UMA 0.1 getestet (WireGuard simuliert). Die EXE wird bei GitHub auf einem frischen Windows gebaut und dort mit echtem WireGuard getestet (Workflow „VERA-Connect Windows“, Release `connect-windows`). Im echten Netz noch nicht im Einsatz.
 
 Quelltext: [`connect/`](../connect) – Python, nur Standardbibliothek, mit Nuitka zu einer EXE übersetzt (kein Python auf den Rechnern nötig).
@@ -36,7 +37,7 @@ Installiert wird nach `C:\Program Files\VERA-Connect\`, Daten in `C:\ProgramData
 4. Der Client holt die Konfiguration, speichert sie verschlüsselt zwischen, installiert bei Bedarf **WireGuard** (offizielles MSI von download.wireguard.com, Signatur „WireGuard LLC“ geprüft), richtet den **Tunnel als Dienst** ein (`WireGuardTunnel$<Name>`, ein Tunnel je Rechner, läuft schon vor der Anmeldung) und schaltet den **WireGuard-Manager/Tray** ab.
 5. Ab dann alle 30 s der **Wächter**: Tunnel weg → aus dem Zwischenspeicher wiederherstellen; kein Handshake seit 3 Minuten (und Internet da) → neu verbinden, mit wachsenden Pausen.
 6. Alle 5 Minuten Abgleich mit VERA: geänderter Zugang (neue Schlüssel, andere Netze, Standortverbindung) → neue Konfiguration wird eingespielt. Gesperrt → Tunnel wird entfernt.
-7. Täglich: neuere WireGuard-Version → still installieren. Alle 6 Stunden: neuere VERA-Connect-Version in UMA → laden, **Signatur und SHA-256 prüfen**, Dienst ersetzt sich selbst.
+7. Alle 6 Stunden fragt VERA-Connect bei UMA nach: neuere VERA-Connect-Version → laden, **Signatur und SHA-256 prüfen**, Dienst ersetzt sich selbst. Bietet UMA die Komponente **wireguard** an, kommt WireGuard (Erstinstallation und Updates) aus UMA – du bestimmst dort, wann eine neue WireGuard-Version verteilt wird. Ohne UMA bzw. ohne Komponente: täglich direkt vom Hersteller.
 
 Ist VERA nicht erreichbar, bleibt die letzte Konfiguration aktiv.
 
@@ -57,6 +58,12 @@ Menü: **Verbinden / Trennen** (Trennen nur, wenn in VERA erlaubt – Schalter u
 | **Konfiguration auf dem Rechner** | Tunnel-Datei nur für SYSTEM/Administratoren lesbar, Zwischenspeicher zusätzlich DPAPI-verschlüsselt |
 | **Updates** | WireGuard nur mit gültiger Signatur von WireGuard LLC; VERA-Connect nur mit gültiger UMA-Signatur |
 | **Kein Domänen-Admin** | der Dienst läuft als SYSTEM und braucht keine gespeicherten Zugangsdaten |
+
+## WireGuard über UMA verteilen
+
+1. UMA › Externe Quellen › **+ Quelle**: `https://download.wireguard.com/windows-client/` – UMA erkennt WireGuard, die Architekturen und schlägt „Komponente wireguard für VERA-Connect“ vor.
+2. Neue WireGuard-Versionen holt UMA dann selbst, prüft die Signatur von WireGuard LLC und bietet sie VERA-Connect an (sofort oder als Entwurf).
+3. Die Rechner brauchen dafür keinen Zugriff auf wireguard.com – nur auf UMA (`/u/`).
 
 ## VERA-Connect selbst aktualisieren (UMA)
 

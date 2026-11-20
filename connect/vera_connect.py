@@ -42,7 +42,7 @@ import urllib.request
 
 import ed25519
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -326,11 +326,11 @@ class WireGuard:
         self.exe, self.wg = os.path.join(base, "wireguard.exe"), os.path.join(base, "wg.exe")
 
     def installed(self) -> bool:
-        return SIMULATE or os.path.exists(self.exe)
+        return bool(STATUS.get("sim_wg")) if SIMULATE else os.path.exists(self.exe)
 
     def version(self) -> str:
         if SIMULATE:
-            return "0.0-simuliert"
+            return STATUS.get("sim_wg", "")
         if not os.path.exists(self.exe):
             return ""
         import winreg
@@ -365,17 +365,26 @@ class WireGuard:
         return vers[-1], f"{WG_DOWNLOAD}wireguard-{msi_arch}-{vers[-1]}.msi"
 
     def install(self, version: str, url: str) -> None:
-        """Download the official MSI, check its Authenticode signature (WireGuard LLC), install silently."""
+        """Download the official MSI from the vendor and install it (fallback when UMA does not offer WireGuard)."""
         if SIMULATE:
-            log("[simuliert] WireGuard", version, "installieren")
+            log("[simuliert] WireGuard", version, "vom Hersteller installieren")
+            STATUS["sim_wg"] = version
             return
         d = os.path.join(DATA, "downloads")
         os.makedirs(d, exist_ok=True)
         f = os.path.join(d, url.rsplit("/", 1)[-1])
-        log("Lade WireGuard", version, "…")
+        log("Lade WireGuard", version, "vom Hersteller …")
         with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": f"{APP}/{VERSION}"}), timeout=300, context=_ssl) as r, \
                 open(f, "wb") as out:
             shutil.copyfileobj(r, out)
+        self.install_file(version, f)
+
+    def install_file(self, version: str, f: str) -> None:
+        """Check the Authenticode signature (WireGuard LLC) of the MSI and install it silently."""
+        if SIMULATE:
+            log("[simuliert] WireGuard", version, "aus", os.path.basename(f), "installieren")
+            STATUS["sim_wg"] = version
+            return
         c, o = powershell(f"$s = Get-AuthenticodeSignature -LiteralPath '{f}'; \"$($s.Status)|$($s.SignerCertificate.Subject)\"", 120)
         if not o.startswith("Valid|") or "WireGuard LLC" not in o:
             os.remove(f)
@@ -490,6 +499,7 @@ class Agent:
         self.state = load("state.json")
         self.events: list[str] = []
         self.next_poll = self.next_wg = self.next_self = 0.0
+        self.uma_wg = None
         self.restart_pause, self.next_restart, self.tunnel_started = 60, 0.0, time.time()
         if self.state.get("user_off") and self.state.get("user_off_boot") != boot_time():
             self.state["user_off"] = False                     # a restart of Windows reconnects
@@ -518,7 +528,7 @@ class Agent:
     def report(self) -> dict:
         f = self.dev.refresh_facts()
         t = self.state.get("tunnel")
-        st = {"version": VERSION, "wg_version": self.wg.version(), "hostname": f.get("hostname"), "user": f.get("user") or "",
+        st = {"version": VERSION, "wg_version": self.wg.version(), "wg_source": STATUS.get("wg_source", ""), "hostname": f.get("hostname"), "user": f.get("user") or "",
               "os": f.get("os"), "user_off": bool(self.state.get("user_off")), "tunnel_state": STATUS.get("tunnel_state", "waiting")}
         if t and STATUS.get("tunnel_state") == "up":
             st.update(self.wg.stats(t))
@@ -604,19 +614,89 @@ class Agent:
         self.event(f"Neue Konfiguration eingerichtet (Tunnel {name})")
         set_status(state="ready", message="", tunnel=name)
 
+    # ----- UMA: own updates + components (WireGuard)
+    def uma_base(self) -> str:
+        return (self.conf.get("update_url") or "").rstrip("/")
+
+    def uma_check(self) -> dict | None:
+        """Ask UMA for a newer VERA-Connect and the components (WireGuard). None = no UMA configured."""
+        base = self.uma_base()
+        if not base:
+            return None
+        c = self.conf
+        if not c.get("update_key"):                              # pin the key of this UMA on first contact
+            with urllib.request.urlopen(base + "/u/info", timeout=30, context=_ssl) as r:
+                c["update_key"] = json.loads(r.read())["public_key"]
+            save("config.json", c)
+            log("Signaturschlüssel des Update-Servers gemerkt:", c["update_key"][:16] + "…")
+        f, uma_arch = self.dev.refresh_facts(), arch()[0]
+        wgv = self.wg.version() if self.wg.installed() else ""
+        r = request(self.dev, base, "POST", "/u/check", {"program": PROGRAM, "version": VERSION, "arch": uma_arch,
+                                                          "machine_id": self.dev.machine_id, "public_key": self.dev.public,
+                                                          "hostname": f.get("hostname"), "domain": f.get("domain"),
+                                                          "user": f.get("user"), "os": f.get("os"),
+                                                          "components": {"wireguard": wgv} if wgv else {}})
+        self.uma_wg = next((x for x in r.get("components") or [] if x.get("name") == "wireguard"), None)
+        set_status(update_state=r.get("status"), wg_source="UMA" if self.uma_wg else "Hersteller")
+        return r
+
+    def uma_fetch(self, item: dict, program: str) -> bytes:
+        """Download from UMA and check SHA-256 + UMA signature for this program/component."""
+        blob = request(self.dev, self.uma_base(), "GET", item["url"], raw=True, timeout=900)
+        sha = hashlib.sha256(blob).hexdigest()
+        msg = f"uma-release\n{program}\n{item['version']}\n{sha}".encode()
+        if sha != item["sha256"] or not ed25519.verify(base64.b64decode(self.conf["update_key"]), msg, base64.b64decode(item["signature"])):
+            raise RuntimeError(f"{program} {item['version']} von UMA hat eine ungültige Signatur – wird nicht installiert")
+        return blob
+
+    def wireguard_from_uma(self) -> bool:
+        """Install/update WireGuard from UMA if UMA offers it. True = UMA is responsible for WireGuard."""
+        wg = self.uma_wg
+        if not wg:
+            return False
+        have = self.wg.version() if self.wg.installed() else ""
+        if have and vkey(wg["version"]) <= vkey(have):
+            return True
+        set_status(state="installing" if not have else STATUS.get("state"), message=f"WireGuard {wg['version']} wird aus UMA installiert …")
+        blob = self.uma_fetch(wg, "wireguard")
+        d = os.path.join(DATA, "downloads")
+        os.makedirs(d, exist_ok=True)
+        f = os.path.join(d, wg.get("filename") or f"wireguard-{wg['version']}.msi")
+        with open(f, "wb") as fh:
+            fh.write(blob)
+        try:
+            self.wg.install_file(wg["version"], f)
+        finally:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        self.event(f"WireGuard {wg['version']} aus UMA installiert" + (f" (vorher {have})" if have else ""))
+        t = self.state.get("tunnel")
+        if t and have and not self.state.get("user_off") and self.wg.svc_state(t) != "RUNNING":
+            self.wg.start(t)
+        set_status(message="")
+        return True
+
     # ----- WireGuard install / update
     def ensure_wireguard(self) -> None:
         if self.wg.installed():
             self.wg.disable_manager()
             return
         set_status(state="installing", message="WireGuard wird installiert …")
+        try:
+            if self.uma_base() and self.uma_check() is not None and self.wireguard_from_uma():
+                return
+        except Exception as e:  # noqa: BLE001 – UMA not reachable → vendor
+            log("WireGuard aus UMA nicht möglich, nehme den Hersteller:", e)
         v, url = WireGuard.latest()
         self.wg.install(v, url)
-        self.event(f"WireGuard {v} installiert")
+        self.event(f"WireGuard {v} vom Hersteller installiert")
 
     def wireguard_update(self) -> None:
+        """Daily: newer WireGuard directly from the vendor – only if UMA does not provide WireGuard."""
         self.next_wg = time.time() + WG_CHECK_EVERY
-        if not self.wg.installed() or SIMULATE:
+        if not self.wg.installed() or self.uma_wg:
             return
         try:
             v, url = WireGuard.latest()
@@ -624,7 +704,7 @@ class Agent:
             if vkey(v) > vkey(have):
                 set_status(message=f"WireGuard {v} wird installiert …")
                 self.wg.install(v, url)
-                self.event(f"WireGuard aktualisiert: {have} → {v}")
+                self.event(f"WireGuard aktualisiert: {have} → {v} (Hersteller)")
                 t = self.state.get("tunnel")
                 if t and not self.state.get("user_off") and self.wg.svc_state(t) != "RUNNING":
                     self.wg.start(t)
@@ -633,33 +713,19 @@ class Agent:
             log("WireGuard-Update:", e)
             self.next_wg = time.time() + 3600
 
-    # ----- self update through UMA
+    # ----- self update + components through UMA
     def self_update(self) -> None:
         self.next_self = time.time() + SELF_CHECK_EVERY
-        c = self.conf
-        base = (c.get("update_url") or "").rstrip("/")
-        if not base:
-            return
         try:
-            if not c.get("update_key"):                          # pin the key of this UMA on first contact
-                with urllib.request.urlopen(base + "/u/info", timeout=30, context=_ssl) as r:
-                    c["update_key"] = json.loads(r.read())["public_key"]
-                save("config.json", c)
-                log("Signaturschlüssel des Update-Servers gemerkt:", c["update_key"][:16] + "…")
-            f, uma_arch = self.dev.refresh_facts(), arch()[0]
-            r = request(self.dev, base, "POST", "/u/check", {"program": PROGRAM, "version": VERSION, "arch": uma_arch,
-                                                              "machine_id": self.dev.machine_id, "public_key": self.dev.public,
-                                                              "hostname": f.get("hostname"), "domain": f.get("domain"),
-                                                              "user": f.get("user"), "os": f.get("os")})
-            set_status(update_state=r.get("status"))
+            r = self.uma_check()
+            if r is None:
+                return
+            if self.wg.installed():
+                self.wireguard_from_uma()
             u = r.get("update")
             if not u:
                 return
-            blob = request(self.dev, base, "GET", u["url"], raw=True, timeout=600)
-            sha = hashlib.sha256(blob).hexdigest()
-            msg = f"uma-release\n{PROGRAM}\n{u['version']}\n{sha}".encode()
-            if sha != u["sha256"] or not ed25519.verify(base64.b64decode(c["update_key"]), msg, base64.b64decode(u["signature"])):
-                raise RuntimeError(f"Update {u['version']} hat eine ungültige Signatur – wird nicht installiert")
+            blob = self.uma_fetch(u, PROGRAM)
             d = os.path.join(DATA, "update")
             os.makedirs(d, exist_ok=True)
             new = os.path.join(d, f"vera-connect-{u['version']}.exe")

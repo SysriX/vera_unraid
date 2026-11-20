@@ -2,7 +2,7 @@
   "id": "vera",
   "name": "VERA",
   "title": "VPN Endpoint & Remote Access",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "SysriX",
   "description": "WireGuard auf der OPNsense: Zugänge, neue Geräte, Konfigurationen, Standortverbindungen – in MIRA wie direkt in VERA.",
   "group": "Netzwerk",
