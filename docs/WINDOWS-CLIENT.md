@@ -2,6 +2,7 @@
 
 Ein Windows-Programm, das sich seine WireGuard-Konfiguration selbst von VERA holt, WireGuard installiert und aktuell hält, den Tunnel überwacht und sich selbst über [UMA](https://github.com/SysriX/uma_unraid) aktualisiert. Rechner einmal installieren und in VERA freigeben – danach kümmert sich niemand mehr darum, auch nicht nach einem Konfigurationsverlust, neuen Schlüsseln oder einem WireGuard-Update.
 
+> **Stand 1.1.1:** unvollständige Zertifikatsketten werden ausgeglichen, Fehler im Tray mit Grund.
 > **Stand 1.1.0:** WireGuard kommt aus UMA (Komponente), sonst vom Hersteller.
 > **Stand 1.0.0:** Ablauf gegen VERA 1.2 und UMA 0.1 getestet (WireGuard simuliert). Die EXE wird bei GitHub auf einem frischen Windows gebaut und dort mit echtem WireGuard getestet (Workflow „VERA-Connect Windows“, Release `connect-windows`). Im echten Netz noch nicht im Einsatz.
 
@@ -70,3 +71,13 @@ Menü: **Verbinden / Trennen** (Trennen nur, wenn in VERA erlaubt – Schalter u
 1. In UMA das Programm **`vera-connect`** anlegen (Wer bekommt Updates? → nur freigegebene Rechner oder alle).
 2. Neue `VERA-Connect-Setup.exe` als neue Version hochladen und veröffentlichen.
 3. Die Rechner fragen alle 6 Stunden nach; bei „nur freigegebene Rechner“ erscheinen sie in UMA › Rechner zur Freigabe.
+
+## Fehlersuche
+
+| Meldung im Tray (Status) bzw. in `C:\ProgramData\VERA-Connect\connect.log` | Ursache · Lösung |
+| --- | --- |
+| **Zertifikat von VERA nicht prüfbar (unable to get local issuer certificate)** | Der Server/Reverse-Proxy schickt nur sein eigenes Zertifikat ohne Zwischenzertifikat. Browser gleichen das aus, Programme nicht. VERA-Connect ≥ 1.1.1 lädt die fehlenden Zwischenzertifikate dann selbst nach (die Prüfung bleibt streng – nur gegen bereits vertrauenswürdige Wurzeln). **Richtig beheben:** am Reverse-Proxy die vollständige Kette (*fullchain*) hinterlegen. Prüfen: `openssl s_client -connect <VERA_EXTERN>:443 -servername <VERA_EXTERN> -showcerts` muss mehr als ein Zertifikat zeigen |
+| Name von VERA nicht auflösbar (DNS) | DNS-Eintrag fehlt oder der Rechner nutzt einen anderen DNS |
+| Zeitüberschreitung | Port 443 von außen gesperrt bzw. Weiterleitung fehlt |
+| VERA antwortet nicht wie erwartet | vor `/client/` hängt eine Anmeldeseite (z. B. Authentik) – `/client/` im Proxy ohne Anmeldung durchlassen (die Anfragen sind signiert) |
+| wartet auf Freigabe in VERA | Rechner in VERA › Rechner freigeben |

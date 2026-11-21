@@ -1,14 +1,6 @@
 <?xml version='1.0' encoding='utf8'?>
 <nuitka-compilation-report nuitka_version="4.3.5" nuitka_commercial_version="not installed" mode="onefile" completion="exception">
-  <exception exception_type="PermissionError" exception_value="[Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local\\Temp\\claude\\960e2d58b26b2b93\\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\\scratchpad\\dist\\vera-connect.exe'">
-Traceback (most recent call last):
-  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\utils\FileOperations.py", line 1400, in renameFile
-    os.rename(source_filename, dest_filename)
-    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-FileExistsError: [WinError 183] Eine Datei kann nicht erstellt werden, wenn sie bereits vorhanden ist: 'C:\\Users\\Marco\\AppData\\Local\\Temp\\claude\\960E2D~1\\3D0B9E~1\\SCRATC~1\\dist\\VERA_C~1.ONE\\_nuitka_temp.exe' -&gt; 'C:\\Users\\Marco\\AppData\\Local\\Temp\\claude\\960e2d58b26b2b93\\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\\scratchpad\\dist\\vera-connect.exe'
-
-During handling of the above exception, another exception occurred:
-
+  <exception exception_type="ZstdError" exception_value="zstd compress error: Allocation error : not enough memory">
 Traceback (most recent call last):
   File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\MainControl.py", line 1454, in main
     _main()
@@ -27,35 +19,45 @@ Traceback (most recent call last):
         ^^^^^^^^^^^^^^^^^^^^^^^^^^
     )
     ^
-  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\freezer\Onefile.py", line 308, in packDistFolderToOnefileBootstrap
-    _runOnefileScons(
-    ~~~~~~~~~~~~~~~~^
-        onefile_compression=compressor_python is not None,
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...&lt;2 lines&gt;...
-        onefile_payload_size=onefile_payload_size,
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\freezer\Onefile.py", line 297, in packDistFolderToOnefileBootstrap
+    runOnefileCompressor(
+    ~~~~~~~~~~~~~~~~~~~~^
+        compressor_python=compressor_python,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...&lt;3 lines&gt;...
+        expected_files=expected_files,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     )
     ^
-  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\freezer\Onefile.py", line 136, in _runOnefileScons
-    result = runScons(
-        scons_options=scons_options,
-    ...&lt;6 lines&gt;...
-        ),
+  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\freezer\Onefile.py", line 204, in runOnefileCompressor
+    attachOnefilePayload(
+    ~~~~~~~~~~~~~~~~~~~~^
+        dist_dir=dist_dir,
+        ^^^^^^^^^^^^^^^^^^
+    ...&lt;10 lines&gt;...
+        expected_files=expected_files,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     )
-  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\build\SconsInterface.py", line 658, in runScons
-    renameFile(scons_created_exe, orig_result_exe)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\utils\FileOperations.py", line 1402, in renameFile
-    copyFile(source_filename, dest_filename)
-    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\utils\FileOperations.py", line 1504, in copyFile
-    shutil.copyfile(source_path, dest_path)
-    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\Marco\AppData\Local\Programs\Python\Python313\Lib\shutil.py", line 262, in copyfile
-    with open(dst, 'wb') as fdst:
-         ~~~~^^^^^^^^^^^
-PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local\\Temp\\claude\\960e2d58b26b2b93\\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\\scratchpad\\dist\\vera-connect.exe'
+    ^
+  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\tools\onefile_compressor\OnefileCompressor.py", line 436, in attachOnefilePayload
+    _attachOnefilePayload()
+    ~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\utils\Utils.py", line 545, in retryingFunction
+    result = func(*args, **kwargs)
+  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\tools\onefile_compressor\OnefileCompressor.py", line 386, in _attachOnefilePayload
+    payload_size += _attachOnefilePayloadFile(
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        output_file=compressed_file,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...&lt;10 lines&gt;...
+        win_path_sep=win_path_sep,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\Marco\AppData\Local\Temp\claude\960e2d58b26b2b93\3d0b9ea6-87c9-4c07-b740-4dff9b548dc8\scratchpad\buildvenv\Lib\site-packages\nuitka\tools\onefile_compressor\OnefileCompressor.py", line 150, in _attachOnefilePayloadFile
+    output_file.write(filename_encoded)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+zstandard.backend_c.ZstdError: zstd compress error: Allocation error : not enough memory
 </exception>
   <scons_environment c_compiler="zig" the_cc_name="zig.exe" the_compiler="~\AppData\Local\Nuitka\Nuitka\Cache\downloads\pip\private-dc688c34\Lib\site-packages\ziglang\zig.exe" />
   <module name="__future__" kind="UncompiledPythonModule" usage="import" reason="Including as part of the non-excluded parts of standard library." source_path="${sys.real_prefix}\Lib\__future__.py">
@@ -70,12 +72,12 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
   </module>
   <module name="__main__" kind="PythonMainModule" usage="root_module" reason="Root module" source_path="${cwd}\vera_connect.py">
     <plugin-influence name="implicit-imports" influence="condition-used" condition="module_mode and plugin(&quot;pyside6&quot;)" tags_used="module_mode" result="false" />
-    <optimization-time pass="1" time="0.5156" micro_passes="7" max_branch_merge="34" merged_total="10261" />
-    <optimization-time pass="2" time="0.0469" micro_passes="1" max_branch_merge="32" merged_total="1428" />
-    <code-generation-time time="0.2188" />
+    <optimization-time pass="1" time="0.8906" micro_passes="7" max_branch_merge="34" merged_total="10901" />
+    <optimization-time pass="2" time="0.0938" micro_passes="1" max_branch_merge="32" merged_total="1518" />
+    <code-generation-time time="0.3906" />
     <c-compilation-resources>
       <c-cache tech="none" />
-      <object-file size="3758878" />
+      <object-file size="3976075" />
     </c-compilation-resources>
     <module_usages>
       <module_usage name="__future__" finding="absolute" line="21" reason="import" />
@@ -111,28 +113,30 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
       <module_usage name="ntpath" finding="absolute" line="325" reason="import" />
       <module_usage name="ntpath" finding="absolute" line="326" reason="import" />
       <module_usage name="winreg" finding="absolute" line="336" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="372" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="374" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="414" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="663" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="665" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="672" reason="import" />
-      <module_usage name="traceback" finding="absolute" line="772" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="777" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="799" reason="import" />
-      <module_usage name="winreg" finding="absolute" line="803" reason="import" />
-      <module_usage name="winreg" finding="absolute" line="817" reason="import" />
-      <module_usage name="winservice" finding="absolute" line="876" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="901" reason="import" />
-      <module_usage name="winservice" finding="absolute" line="932" reason="import" />
-      <module_usage name="tray" finding="absolute" line="940" reason="import" />
-      <module_usage name="winservice" finding="absolute" line="965" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="1002" reason="import" />
-      <module_usage name="ntpath" finding="absolute" line="1003" reason="import" />
-      <module_usage name="winservice" finding="absolute" line="1078" reason="import" />
-      <module_usage name="tray" finding="absolute" line="1088" reason="import" />
-      <module_usage name="winservice" finding="absolute" line="1094" reason="import" />
-      <module_usage name="traceback" finding="absolute" line="1099" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="373" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="375" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="423" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="662" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="664" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="729" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="731" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="738" reason="import" />
+      <module_usage name="traceback" finding="absolute" line="838" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="843" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="865" reason="import" />
+      <module_usage name="winreg" finding="absolute" line="869" reason="import" />
+      <module_usage name="winreg" finding="absolute" line="883" reason="import" />
+      <module_usage name="winservice" finding="absolute" line="942" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="967" reason="import" />
+      <module_usage name="winservice" finding="absolute" line="998" reason="import" />
+      <module_usage name="tray" finding="absolute" line="1006" reason="import" />
+      <module_usage name="winservice" finding="absolute" line="1031" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="1068" reason="import" />
+      <module_usage name="ntpath" finding="absolute" line="1069" reason="import" />
+      <module_usage name="winservice" finding="absolute" line="1144" reason="import" />
+      <module_usage name="tray" finding="absolute" line="1154" reason="import" />
+      <module_usage name="winservice" finding="absolute" line="1160" reason="import" />
+      <module_usage name="traceback" finding="absolute" line="1165" reason="import" />
       <module_usage name="_collections_abc" finding="absolute" reason="stdlib" />
       <module_usage name="_opcode_metadata" finding="absolute" reason="stdlib" />
       <module_usage name="_weakrefset" finding="absolute" reason="stdlib" />
@@ -1198,7 +1202,7 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
   <module name="ctypes" kind="UncompiledPythonPackage" usage="import" reason="Instructed by user to follow to all modules." source_path="${sys.real_prefix}\Lib\ctypes\__init__.py">
     <plugin-influence name="implicit-imports" influence="condition-used" condition="has_builtin_module(&quot;_ctypes&quot;)" tags_used="has_builtin_module" result="false" />
     <optimization-time pass="1" time="0.2344" micro_passes="5" max_branch_merge="17" merged_total="5366" />
-    <optimization-time pass="2" time="0.0000" />
+    <optimization-time pass="2" time="0.0156" />
     <module_usages>
       <module_usage name="os" finding="absolute" line="1" reason="import" />
       <module_usage name="os" finding="absolute" line="3" reason="import" />
@@ -1318,12 +1322,12 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
     </module_usages>
   </module>
   <module name="ed25519" kind="CompiledPythonModule" usage="root_module" reason="Root module" source_path="${cwd}\ed25519.py">
-    <optimization-time pass="1" time="0.0625" micro_passes="4" max_branch_merge="13" merged_total="537" />
+    <optimization-time pass="1" time="0.0938" micro_passes="4" max_branch_merge="13" merged_total="537" />
     <optimization-time pass="2" time="0.0000" micro_passes="1" max_branch_merge="12" merged_total="129" />
-    <code-generation-time time="0.0156" />
+    <code-generation-time time="0.0312" />
     <c-compilation-resources>
       <c-cache tech="none" />
-      <object-file size="612696" />
+      <object-file size="612692" />
     </c-compilation-resources>
     <module_usages>
       <module_usage name="__future__" finding="absolute" line="7" reason="import" />
@@ -2228,7 +2232,7 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
   </module>
   <module name="encodings.latin_1" kind="UncompiledPythonModule" usage="stdlib" reason="Technically required for CPython library startup." source_path="${sys.real_prefix}\Lib\encodings\latin_1.py">
     <optimization-time pass="1" time="0.0156" micro_passes="3" max_branch_merge="8" merged_total="470" />
-    <optimization-time pass="2" time="0.0156" />
+    <optimization-time pass="2" time="0.0000" />
     <module_usages>
       <module_usage name="codecs" finding="absolute" line="9" reason="import" />
     </module_usages>
@@ -3125,7 +3129,7 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
   </module>
   <module name="inspect" kind="UncompiledPythonModule" usage="import" reason="Technically required for CPython library startup." source_path="${sys.real_prefix}\Lib\inspect.py">
     <optimization-time pass="1" time="1.2344" micro_passes="7" max_branch_merge="59" merged_total="19386" />
-    <optimization-time pass="2" time="0.0000" />
+    <optimization-time pass="2" time="0.0156" />
     <module_usages>
       <module_usage name="abc" finding="absolute" line="144" reason="import" />
       <module_usage name="ast" finding="absolute" line="145" reason="import" />
@@ -4324,9 +4328,9 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
     </module_usages>
   </module>
   <module name="tray" kind="CompiledPythonModule" usage="root_module" reason="Root module" source_path="${cwd}\tray.py">
-    <optimization-time pass="1" time="0.2656" micro_passes="7" max_branch_merge="20" merged_total="4119" />
+    <optimization-time pass="1" time="0.4062" micro_passes="7" max_branch_merge="20" merged_total="4119" />
     <optimization-time pass="2" time="0.0312" micro_passes="1" max_branch_merge="19" merged_total="553" />
-    <code-generation-time time="0.0781" />
+    <code-generation-time time="0.1562" />
     <c-compilation-resources>
       <c-cache tech="none" />
       <object-file size="1673113" />
@@ -4531,9 +4535,9 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
     </module_usages>
   </module>
   <module name="winservice" kind="CompiledPythonModule" usage="root_module" reason="Root module" source_path="${cwd}\winservice.py">
-    <optimization-time pass="1" time="0.0469" micro_passes="6" max_branch_merge="15" merged_total="969" />
+    <optimization-time pass="1" time="0.0781" micro_passes="6" max_branch_merge="15" merged_total="969" />
     <optimization-time pass="2" time="0.0000" micro_passes="1" max_branch_merge="15" merged_total="149" />
-    <code-generation-time time="0.0312" />
+    <code-generation-time time="0.0625" />
     <c-compilation-resources>
       <c-cache tech="none" />
       <object-file size="735254" />
@@ -4628,9 +4632,9 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
     </module_usages>
   </module>
   <performance>
-    <memory_usage name="after_launch" value="44654592" />
-    <memory_usage name="before_c_code_generation" value="75108352" />
-    <memory_usage name="before_running_scons" value="75902976" />
+    <memory_usage name="after_launch" value="44642304" />
+    <memory_usage name="before_c_code_generation" value="74731520" />
+    <memory_usage name="before_running_scons" value="77062144" />
   </performance>
   <included_extension name="_bz2.pyd" dest_path="_bz2.pyd" source_path="${sys.real_prefix}\DLLs\_bz2.pyd" package="" ignored="no" reason="used extension module" tags="copy" />
   <included_extension name="_ctypes.pyd" dest_path="_ctypes.pyd" source_path="${sys.real_prefix}\DLLs\_ctypes.pyd" package="" ignored="no" reason="used extension module" tags="copy" />
@@ -4649,22 +4653,22 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
   <included_dll name="vcruntime140.dll" dest_path="vcruntime140.dll" source_path="${sys.real_prefix}\vcruntime140.dll" package="" ignored="no" reason="Used by '_bz2.pyd'" tags="copy" />
   <included_dll name="vcruntime140_1.dll" dest_path="vcruntime140_1.dll" source_path="${sys.real_prefix}\vcruntime140_1.dll" package="" ignored="no" reason="Used by '_wmi.pyd'" tags="copy" />
   <included_dll name="vera_connect.dll" dest_path="vera_connect.dll" source_path="{generated}" package="" ignored="no" reason="main binary" tags="copy" />
-  <data_composer blob_size="5369452" total="2099">
+  <data_composer blob_size="5370412" total="2140">
     <module_data filename="__bytecode.const" blob_name=".bytecode" blob_size="5339900" input_size="5364355" />
     <module_data filename="__constants.const" blob_name="" blob_size="1061" input_size="2636" />
-    <module_data filename="module.__main__.const" blob_name="__main__" blob_size="17525" input_size="35349" />
+    <module_data filename="module.__main__.const" blob_name="__main__" blob_size="18485" input_size="37287" />
     <module_data filename="module.ed25519.const" blob_name="ed25519" blob_size="1033" input_size="3144" />
     <module_data filename="module.tray.const" blob_name="tray" blob_size="6222" input_size="13885" />
     <module_data filename="module.winservice.const" blob_name="winservice" blob_size="3643" input_size="7412" />
   </data_composer>
   <performance-totals>
-    <optimization-time pass="1" time="35.5156" module_count="364" />
-    <optimization-time pass="2" time="0.0938" module_count="364" />
-    <optimization-time pass="all" time="35.6094" module_count="364" />
-    <code-generation-time time="0.3438" module_count="4" />
+    <optimization-time pass="1" time="36.0938" module_count="364" />
+    <optimization-time pass="2" time="0.1562" module_count="364" />
+    <optimization-time pass="all" time="36.2500" module_count="364" />
+    <code-generation-time time="0.6406" module_count="4" />
   </performance-totals>
-  <python_binary filename="vera_connect.dll" backend_resource_mode="c23_embed" reproducible="no" size="7204864" />
-  <onefile_binary filename="vera-connect.exe" onefile_resource_mode="c23_embed" reproducible="no" size="7088128" />
+  <python_binary filename="vera_connect.dll" backend_resource_mode="c23_embed" reproducible="no" size="7227392" />
+  <onefile_binary filename="vera-connect.exe" />
   <command_line>
     <option value="--onefile" />
     <option value="--assume-yes-for-downloads" />
@@ -4678,8 +4682,8 @@ PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Marco\\AppData\\Local
     <option value="--windows-company-name=SysriX" />
     <option value="--windows-product-name=VERA-Connect" />
     <option value="--windows-file-description=VERA-Connect (WireGuard-Verbindung zu VERA)" />
-    <option value="--windows-file-version=1.0.0" />
-    <option value="--windows-product-version=1.0.0" />
+    <option value="--windows-file-version=1.1.0" />
+    <option value="--windows-product-version=1.1.0" />
     <option value="--output-filename=vera-connect.exe" />
     <option value="--output-dir=C:/Users/Marco/AppData/Local/Temp/claude/960e2d58b26b2b93/3d0b9ea6-87c9-4c07-b740-4dff9b548dc8/scratchpad/dist" />
     <option value="vera_connect.py" />

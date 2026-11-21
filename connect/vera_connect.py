@@ -42,7 +42,7 @@ import urllib.request
 
 import ed25519
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -259,7 +259,123 @@ class HttpError(Exception):
         self.status, self.detail = status, detail
 
 
-_ssl = ssl.create_default_context()
+def _tls_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    # Python 3.13 trusts any certificate in the store as anchor (PARTIAL_CHAIN). Switched off: an intermediate fetched
+    # via AIA must still chain up to a root of Windows – it only fills a gap, it never becomes trusted by itself.
+    if hasattr(ssl, "VERIFY_X509_PARTIAL_CHAIN"):
+        ctx.verify_flags &= ~ssl.VERIFY_X509_PARTIAL_CHAIN
+    return ctx
+
+
+_ssl = _tls_context()
+_aia_tried: set[str] = set()
+
+
+def _load_extra_ca() -> None:
+    p = os.path.join(DATA, "ca-extra.pem")
+    if os.path.exists(p):
+        try:
+            _ssl.load_verify_locations(cafile=p)
+        except (OSError, ssl.SSLError) as e:
+            log("ca-extra.pem nicht lesbar:", e)
+
+
+def _aia_issuer_url(der: bytes) -> str | None:
+    """URL of the issuing certificate (Authority Information Access, id-ad-caIssuers) inside a DER certificate."""
+    oid = bytes.fromhex("06082b06010505073002")
+    i = der.find(oid)
+    if i < 0:
+        return None
+    j = i + len(oid)
+    if j + 2 > len(der) or der[j] != 0x86:
+        return None
+    ln, k = der[j + 1], j + 2
+    if ln & 0x80:
+        n = ln & 0x7F
+        ln, k = int.from_bytes(der[k:k + n], "big"), k + n
+    url = der[k:k + ln].decode("ascii", "replace")
+    return url if url.startswith(("http://", "https://")) else None
+
+
+def _cert_names(pem: str) -> tuple:
+    """(subject, issuer) of a PEM certificate – standard library only."""
+    fd, path = tempfile.mkstemp(suffix=".pem")
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(pem)
+        d = ssl._ssl._test_decode_cert(path)                        # noqa: SLF001 – the only stdlib X.509 parser
+        return d.get("subject"), d.get("issuer")
+    finally:
+        os.remove(path)
+
+
+def fetch_missing_intermediate(url: str) -> bool:
+    """The server sends only its own certificate (chain incomplete). Browsers fill the gap themselves – we do the same:
+    follow the issuer addresses (AIA) upwards, at most 4 steps, and load the intermediates. A self-signed root found
+    on the way is never loaded: the chain must still end at a root that Windows already trusts."""
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    host, port = u.hostname, u.port or 443
+    if not host or host in _aia_tried:
+        return False
+    _aia_tried.add(host)
+    raw = ssl.create_default_context()
+    raw.check_hostname, raw.verify_mode = False, ssl.CERT_NONE
+    with socket.create_connection((host, port), timeout=15) as sock, raw.wrap_socket(sock, server_hostname=host) as t:
+        der = t.getpeercert(binary_form=True) or b""
+    loaded = []
+    for _ in range(4):
+        issuer = _aia_issuer_url(der)
+        if not issuer:
+            break
+        with urllib.request.urlopen(urllib.request.Request(issuer, headers={"User-Agent": f"{APP}/{VERSION}"}), timeout=20) as r:
+            data = r.read(200_000)
+        pem = data.decode("ascii", "replace") if data.lstrip().startswith(b"-----BEGIN") else ssl.DER_cert_to_PEM_cert(data)
+        subj, iss = _cert_names(pem)
+        if subj == iss:                                             # a root – never trusted from the network
+            break
+        _ssl.load_verify_locations(cadata=pem)
+        loaded.append((issuer, pem))
+        der = ssl.PEM_cert_to_DER_cert(pem)
+    if not loaded:
+        return False
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        cache = os.path.join(DATA, "ca-extra.pem")
+        have = open(cache, encoding="ascii").read() if os.path.exists(cache) else ""
+        with open(cache, "a", encoding="ascii") as f:
+            for _, pem in loaded:
+                if pem.strip() not in have:                         # no duplicates
+                    f.write(pem.strip() + "\n")
+    except OSError:
+        pass
+    log(f"{host} schickt die Zertifikatskette unvollständig – {len(loaded)} Zwischenzertifikat(e) nachgeladen "
+        f"({', '.join(x for x, _ in loaded)}). Besser: am Server/Reverse-Proxy die vollständige Kette (fullchain) eintragen.")
+    return True
+
+
+def _is_chain_error(e: BaseException) -> bool:
+    r = getattr(e, "reason", e)
+    return isinstance(r, ssl.SSLCertVerificationError) and getattr(r, "verify_code", 0) in (2, 20, 21)   # unable to get (local) issuer
+
+
+def explain(e: BaseException) -> str:
+    """Short German reason for the tray/log instead of only "not reachable"."""
+    r = getattr(e, "reason", e)
+    if isinstance(r, ssl.SSLCertVerificationError):
+        return f"Zertifikat von VERA nicht prüfbar ({r.verify_message})"
+    if isinstance(r, ssl.SSLError):
+        return f"TLS-Fehler ({r})"
+    if isinstance(r, socket.gaierror):
+        return "Name von VERA nicht auflösbar (DNS)"
+    if isinstance(r, (TimeoutError, socket.timeout)):
+        return "Zeitüberschreitung – Port gesperrt oder Weiterleitung fehlt?"
+    if isinstance(r, ConnectionRefusedError):
+        return "Verbindung abgelehnt"
+    if isinstance(e, ValueError):
+        return "VERA antwortet nicht wie erwartet (Anmeldeseite oder Proxy davor?)"
+    return str(r)[:200]
 
 
 def request(dev: Device, base: str, method: str, path: str, data: dict | None = None, raw: bool = False, timeout: int = 30):
@@ -271,9 +387,18 @@ def request(dev: Device, base: str, method: str, path: str, data: dict | None = 
                                  headers={"Content-Type": "application/json", "User-Agent": f"{APP}/{VERSION}",
                                           **dev.headers(method, urlsplit(full).path, body)})
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_ssl) as r:
-            b = r.read()
-            return b if raw else json.loads(b or b"{}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=_ssl) as r:
+                b = r.read()
+        except urllib.error.URLError as e:
+            if isinstance(e, urllib.error.HTTPError) or not _is_chain_error(e) or not fetch_missing_intermediate(full):
+                raise
+            req = urllib.request.Request(full, data=body if method != "GET" else None, method=method,
+                                         headers={"Content-Type": "application/json", "User-Agent": f"{APP}/{VERSION}",
+                                                  **dev.headers(method, urlsplit(full).path, body)})
+            with urllib.request.urlopen(req, timeout=timeout, context=_ssl) as r:
+                b = r.read()
+        return b if raw else json.loads(b or b"{}")
     except urllib.error.HTTPError as e:
         try:
             detail = json.loads(e.read() or b"{}").get("detail") or e.reason
@@ -494,6 +619,7 @@ def boot_time() -> int:
 
 class Agent:
     def __init__(self):
+        _load_extra_ca()
         self.dev = Device()
         self.wg = WireGuard()
         self.state = load("state.json")
@@ -592,9 +718,11 @@ class Agent:
             log("VERA:", e)
             self.next_poll = time.time() + 120
         except (OSError, ValueError) as e:                       # offline: keep using the cached configuration
+            why = explain(e)
             set_status(state="offline" if not self.state.get("config") else STATUS.get("state", "offline"),
-                       message="VERA nicht erreichbar – letzte Konfiguration bleibt aktiv", last_error=str(e)[:200])
-            log("VERA nicht erreichbar:", e)
+                       message=f"VERA nicht erreichbar: {why}" + (" – letzte Konfiguration bleibt aktiv" if self.state.get("config") else ""),
+                       last_error=why)
+            log("VERA nicht erreichbar:", why, "|", repr(e)[:300])
             self.next_poll = time.time() + 120
 
     def fetch_and_apply(self) -> None:
@@ -625,8 +753,15 @@ class Agent:
             return None
         c = self.conf
         if not c.get("update_key"):                              # pin the key of this UMA on first contact
-            with urllib.request.urlopen(base + "/u/info", timeout=30, context=_ssl) as r:
-                c["update_key"] = json.loads(r.read())["public_key"]
+            try:
+                with urllib.request.urlopen(base + "/u/info", timeout=30, context=_ssl) as r:
+                    info = r.read()
+            except urllib.error.URLError as e:
+                if isinstance(e, urllib.error.HTTPError) or not _is_chain_error(e) or not fetch_missing_intermediate(base):
+                    raise
+                with urllib.request.urlopen(base + "/u/info", timeout=30, context=_ssl) as r:
+                    info = r.read()
+            c["update_key"] = json.loads(info)["public_key"]
             save("config.json", c)
             log("Signaturschlüssel des Update-Servers gemerkt:", c["update_key"][:16] + "…")
         f, uma_arch = self.dev.refresh_facts(), arch()[0]
