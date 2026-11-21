@@ -42,7 +42,7 @@ import urllib.request
 
 import ed25519
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -56,6 +56,18 @@ WG_DOWNLOAD = "https://download.wireguard.com/windows-client/"
 POLL_MIN = 20
 if os.environ.get("VC_FAST"):                                     # tests: seconds instead of minutes/hours
     WATCH_EVERY, SELF_CHECK_EVERY, POLL_MIN = 2, 8, 2
+
+
+# IPv4 first: many connections have an AAAA record (e.g. dynamic DNS) whose IPv6 path does not reach the proxy.
+# Browsers hide that (Happy Eyeballs); Python would wait for the timeout on IPv6. IPv6 stays as fallback.
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_v4_first(*args, **kwargs):
+    return sorted(_orig_getaddrinfo(*args, **kwargs), key=lambda r: r[0] != socket.AF_INET)
+
+
+socket.getaddrinfo = _getaddrinfo_v4_first
 
 
 def default_data() -> str:
@@ -1045,13 +1057,24 @@ def diagnose(data: str | None = None) -> str:
         except OSError as e:
             out.append(f"  1. Name NICHT auflösbar: {e}  → DNS prüfen")
             continue
-        try:
+        reach = []
+        for ip in ips:
+            fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
             t0 = time.time()
-            socket.create_connection((host, port), timeout=10).close()
-            out.append(f"  2. Port {port} erreichbar ({int((time.time() - t0) * 1000)} ms)")
-        except OSError as e:
-            out.append(f"  2. Port {port} NICHT erreichbar: {e}  → Weiterleitung/Firewall/Proxy prüfen")
+            try:
+                with socket.socket(fam, socket.SOCK_STREAM) as sk:
+                    sk.settimeout(6)
+                    sk.connect((ip, port))
+                reach.append(ip)
+                out.append(f"  2. {'IPv6' if fam == socket.AF_INET6 else 'IPv4'} {ip} Port {port}: erreichbar ({int((time.time() - t0) * 1000)} ms)")
+            except OSError as e:
+                out.append(f"  2. {'IPv6' if fam == socket.AF_INET6 else 'IPv4'} {ip} Port {port}: NICHT erreichbar ({e.__class__.__name__}: {e})")
+        if not reach:
+            out.append("     → keine Adresse erreichbar: Weiterleitung/Firewall/Proxy prüfen")
             continue
+        if len(reach) < len(ips):
+            out.append("     → nicht alle Adressen erreichbar. Ist nur IPv6 betroffen: am Proxy/Firewall Port %d für IPv6 freigeben "
+                       "oder den AAAA-Eintrag im DNS entfernen. VERA-Connect nimmt IPv4 zuerst." % port)
         if u.scheme == "https":
             raw = ssl.create_default_context()
             raw.check_hostname, raw.verify_mode = False, ssl.CERT_NONE
