@@ -2,6 +2,7 @@
 
 Ein Windows-Programm, das sich seine WireGuard-Konfiguration selbst von VERA holt, WireGuard installiert und aktuell hält, den Tunnel überwacht und sich selbst über [UMA](https://github.com/SysriX/uma_unraid) aktualisiert. Rechner einmal installieren und in VERA freigeben – danach kümmert sich niemand mehr darum, auch nicht nach einem Konfigurationsverlust, neuen Schlüsseln oder einem WireGuard-Update.
 
+> **Stand 1.1.5:** Installer mit eingebauten Einstellungen (VERA › Rechner), Verbindung prüfen im Tray, IPv4 zuerst, Kette über Windows-Prüfung.
 > **Stand 1.1.1:** unvollständige Zertifikatsketten werden ausgeglichen, Fehler im Tray mit Grund.
 > **Stand 1.1.0:** WireGuard kommt aus UMA (Komponente), sonst vom Hersteller.
 > **Stand 1.0.0:** Ablauf gegen VERA 1.2 und UMA 0.1 getestet (WireGuard simuliert). Die EXE wird bei GitHub auf einem frischen Windows gebaut und dort mit echtem WireGuard getestet (Workflow „VERA-Connect Windows“, Release `connect-windows`). Im echten Netz noch nicht im Einsatz.

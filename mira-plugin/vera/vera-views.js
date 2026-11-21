@@ -207,6 +207,39 @@ function veraViews(ctx) {
       tabelle([{ t: "Zeit", w: x => datum(x.t) }, { t: "Ereignis", w: x => x.e }], c.history.slice(0, 15), { leer: "–" })), kn);
   }
 
+  async function installerCard() {
+    const i = await ctx.api("GET", "/api/clients/installer/settings");
+    const f = h("div", {},
+      h("div", { class: "raster" },
+        feld("Adresse von VERA *", eingabe("vera_url", i.vera_url || i.suggest_vera_url, { placeholder: "https://vera.<Domain>" }), "so erreichen die Rechner VERA (von außen: nur /client/ nötig)"),
+        feld("Update-Server (UMA)", eingabe("update_url", i.update_url, { placeholder: "https://update.<Domain> – leer = keine Selbst-Updates" })),
+        feld("UMA-Signaturschlüssel", eingabe("update_key", i.update_key, { placeholder: "optional – UMA › Programme › Signaturschlüssel" }), "leer = wird beim ersten Kontakt gemerkt"),
+        feld("Name des Tunnels", eingabe("tunnel", i.tunnel, { placeholder: "optional – sonst aus der Freigabe" }))),
+      h("p", { class: "leise klein-t" }, i.enroll_key_set ? "Der Anmelde-Schlüssel wird automatisch mit eingebaut." : "Kein Anmelde-Schlüssel gesetzt – jeder Rechner mit diesem Installer erscheint zur Freigabe."));
+    const old = i.base && i.base.version && (i.base.version.split(".").map(Number).reduce((x, n) => x * 1000 + n, 0) < 1001005);
+    const base = i.base ? h("span", {}, `Grund-EXE: VERA-Connect ${i.base.version || "?"} · ${groesse(i.base.size)} · ${i.base.origin} · ${datum(i.base.time)}`,
+      old ? h("div", { class: "rot" }, "Diese Version kennt eingebaute Einstellungen noch nicht (erst ab 1.1.5) – bitte eine neuere laden.") : null)
+      : "Noch keine Grund-EXE – zuerst „Von GitHub laden“ oder eine EXE hochladen.";
+    const up = h("input", { type: "file", accept: ".exe", style: { display: "none" }, onchange: async e => {
+      if (!e.target.files[0]) return;
+      await versuch(() => ctx.api("PUT", "/api/clients/installer/base", e.target.files[0]), "Grund-EXE übernommen"); ctx.rerender();
+    } });
+    const save = () => ctx.api("PUT", "/api/clients/installer/settings", lesenForm(f));
+    return h("div", { class: "karte" },
+      h("h2", {}, "Installer mit eingebauten Einstellungen"),
+      h("p", { class: "leise klein-t" }, "Erzeugt eine VERA-Connect-Setup.exe, in der Adresse von VERA und Update-Server schon stecken: Doppelklick genügt, keine Fragen, keine Parameter. Parameter wie URL=… haben weiterhin Vorrang."),
+      f,
+      h("p", { class: "klein-t" }, base),
+      h("div", { class: "leiste" },
+        h("button", { class: "klein", onclick: async () => { await versuch(() => ctx.api("POST", "/api/clients/installer/refresh"), "Aktuelle Version von GitHub geladen"); ctx.rerender(); } }, "Von GitHub laden"),
+        h("button", { class: "klein", onclick: () => up.click() }, "Eigene EXE hochladen"), up,
+        h("button", { class: "klein", onclick: async () => { await versuch(save, "Gespeichert"); } }, "Speichern"),
+        h("button", { class: "p klein", disabled: !i.base, onclick: async () => {
+          await versuch(save);
+          const x = h("a", { href: ctx.link("/api/clients/installer"), download: "" }); document.body.append(x); x.click(); x.remove();
+        } }, "Installer herunterladen")));
+  }
+
   views.clients = { titel: "Rechner", zeigen: async main => {
     const d = await ctx.api("GET", "/api/clients");
     const a = ctx.can("admin");
@@ -236,6 +269,7 @@ function veraViews(ctx) {
       h("div", { class: "karte" }, h("h2", {}, "Rechner mit VERA-Connect"),
         h("p", { class: "leise klein-t" }, "Windows-Rechner holen sich ihre Konfiguration selbst, halten den Tunnel aufrecht und aktualisieren WireGuard. Von außen muss nur der Pfad /client/ erreichbar sein."),
         keyLine, tabelle(cols, d.clients.filter(c => c.status !== "pending"), { klick: clientDetails, leer: "Noch keine Rechner" })));
+    if (a) main.append(await installerCard());
   } };
 
   views.audit = { titel: "Protokoll", level: "write", zeigen: async main => {

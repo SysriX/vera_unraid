@@ -22,9 +22,11 @@ import json
 import re
 import secrets
 import threading
+import os
 import time
 from datetime import datetime
 
+import httpx
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -347,4 +349,109 @@ def build_admin_router(host, store) -> APIRouter:
         host.audit(u, "VERA-Connect: Einstellungen geändert", "", details=json.dumps({k: (v if k != "enroll_key" else "…") for k, v in d.items()}))
         return {"enroll_key": setting("enroll_key"), "allow_disconnect": setting("allow_disconnect", "1") == "1"}
 
+    # ---- installer with built-in settings (VERA address, update server, keys)
+    @r.get("/installer/settings")
+    def installer_settings(req: Request, u=Depends(admin)):
+        return _installer_info(req)
+
+    @r.put("/installer/settings")
+    async def installer_settings_set(req: Request, u=Depends(admin)):
+        d = await req.json()
+        for k in ("vera_url", "update_url", "update_key", "tunnel", "base_url"):
+            if k in d:
+                set_setting("installer_" + k, (d[k] or "").strip())
+        host.audit(u, "VERA-Connect: Installer-Einstellungen geändert", "", details=json.dumps({k: v for k, v in d.items() if k != "update_key"}))
+        return _installer_info(req)
+
+    @r.post("/installer/refresh")
+    def installer_refresh(req: Request, u=Depends(admin)):
+        url = setting("installer_base_url") or BASE_EXE_URL
+        try:
+            with httpx.Client(timeout=120, follow_redirects=True) as c:
+                resp = c.get(url)
+            if resp.status_code != 200:
+                raise HTTPException(400, f"Download {url}: HTTP {resp.status_code}")
+            _store_base(resp.content, f"heruntergeladen von {url}")
+        except httpx.HTTPError as e:
+            raise HTTPException(400, f"Download fehlgeschlagen: {e}") from e
+        host.audit(u, "VERA-Connect: Grund-EXE aktualisiert", url)
+        return _installer_info(req)
+
+    @r.put("/installer/base")
+    async def installer_base_upload(req: Request, u=Depends(admin)):
+        _store_base(await req.body(), f"hochgeladen von {u['name']}")
+        host.audit(u, "VERA-Connect: Grund-EXE hochgeladen", "")
+        return _installer_info(req)
+
+    @r.get("/installer")
+    def installer_download(req: Request, u=Depends(admin)):
+        """The base EXE plus a line with the settings at the end – VERA-Connect reads it at setup."""
+        from fastapi.responses import Response
+        if not os.path.exists(BASE_EXE):
+            raise HTTPException(409, "Noch keine Grund-EXE – „Von GitHub laden“ oder eine EXE hochladen")
+        info = _installer_info(req)
+        cfg = {"url": info["vera_url"], "update_url": info["update_url"], "update_key": info["update_key"],
+               "enroll_key": setting("enroll_key"), "tunnel": info["tunnel"]}
+        cfg = {k: v for k, v in cfg.items() if v or k == "update_url"}
+        if not cfg.get("url"):
+            raise HTTPException(400, "Adresse von VERA fehlt")
+        data = _strip_config(open(BASE_EXE, "rb").read()) + b"\nVERA-CONNECT-CONFIG:" + json.dumps(cfg).encode() + b"\n"
+        name = "VERA-Connect-Setup-" + re.sub(r"[^A-Za-z0-9.-]", "_", cfg["url"].split("//")[-1].split("/")[0]) + ".exe"
+        host.audit(u, "VERA-Connect: Installer heruntergeladen", cfg["url"],
+                   details=f"Update: {cfg.get('update_url') or '–'}, Anmelde-Schlüssel {'ja' if cfg.get('enroll_key') else 'nein'}")
+        return Response(data, media_type="application/vnd.microsoft.portable-executable",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
     return r
+
+
+# ------------------------------------------------------------------ installer helpers
+BASE_EXE_URL = "https://github.com/SysriX/vera_unraid/releases/download/connect-windows/VERA-Connect-Setup.exe"
+BASE_EXE = os.path.join(core.DATA, "connect", "VERA-Connect-Setup.exe")
+
+
+def _strip_config(b: bytes) -> bytes:
+    i = b.rfind(b"\nVERA-CONNECT-CONFIG:", max(0, len(b) - 65536))
+    return b[:i] if i >= 0 else b
+
+
+def _exe_version(b: bytes) -> str:
+    """FileVersion from the version resource of the EXE (UTF-16) – good enough to show which build is used."""
+    key = "FileVersion".encode("utf-16-le") + b"\x00\x00"
+    i = b.find(key)
+    if i < 0:
+        return ""
+    j = i + len(key)
+    while j < len(b) - 1 and b[j:j + 2] == b"\x00\x00":
+        j += 2
+    k = b.find(b"\x00\x00", j)
+    try:
+        v = b[j:k + (k - j) % 2].decode("utf-16-le").strip("\x00").strip()
+    except UnicodeDecodeError:
+        return ""
+    return v[:-2] if v.endswith(".0") and v.count(".") == 3 else v
+
+
+def _store_base(b: bytes, origin: str) -> None:
+    if len(b) < 100_000 or not b.startswith(b"MZ"):
+        raise HTTPException(400, "Das ist keine Windows-EXE")
+    b = _strip_config(b)
+    os.makedirs(os.path.dirname(BASE_EXE), exist_ok=True)
+    with open(BASE_EXE + ".neu", "wb") as f:
+        f.write(b)
+    os.replace(BASE_EXE + ".neu", BASE_EXE)
+    set_setting("installer_base_info", json.dumps({"origin": origin, "version": _exe_version(b), "size": len(b),
+                                                   "time": now().isoformat()}))
+
+
+def _installer_info(req: Request) -> dict:
+    fwd = req.headers.get("x-forwarded-host") or req.headers.get("host") or ""
+    proto = req.headers.get("x-forwarded-proto") or req.url.scheme
+    try:
+        base = json.loads(setting("installer_base_info") or "{}")
+    except ValueError:
+        base = {}
+    return {"vera_url": setting("installer_vera_url"), "suggest_vera_url": f"{proto}://{fwd}" if fwd else "",
+            "update_url": setting("installer_update_url"), "update_key": setting("installer_update_key"),
+            "tunnel": setting("installer_tunnel"), "base_url": setting("installer_base_url") or BASE_EXE_URL,
+            "base": base if os.path.exists(BASE_EXE) else None, "enroll_key_set": bool(setting("enroll_key"))}

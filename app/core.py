@@ -18,7 +18,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 DATA = os.environ.get("VERA_DATA", "/config")
 KEY_FILE = os.path.join(DATA, "secret.key")
 

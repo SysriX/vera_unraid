@@ -3,3 +3,4 @@
 .wg-config pre{max-height:50vh}
 .wg-qr{width:240px;max-width:100%;background:#fff;border-radius:8px;padding:4px}
 @media (max-width:700px){.wg-config{grid-template-columns:1fr}.wg-qr{margin:0 auto;display:block}}
+.rot{color:#e05a5a}

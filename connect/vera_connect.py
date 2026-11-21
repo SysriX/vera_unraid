@@ -42,7 +42,7 @@ import urllib.request
 
 import ed25519
 
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -1174,6 +1174,29 @@ def tray_autostart(on: bool) -> None:
         log("Tray-Autostart:", e)
 
 
+CONFIG_MARK = b"\nVERA-CONNECT-CONFIG:"
+CONFIG_KEYS = {"url": "URL", "update_url": "UPDATEURL", "update_key": "UPDATEKEY", "enroll_key": "ENROLLKEY", "tunnel": "TUNNEL"}
+
+
+def embedded_config() -> dict:
+    """Settings appended to the EXE (VERA › Rechner › Installer): a line "VERA-CONNECT-CONFIG:{json}" at the very end.
+    Windows ignores data behind the program; setup parameters given on the command line still win."""
+    if not COMPILED:
+        return {}
+    try:
+        with open(os.path.abspath(sys.argv[0]), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            tail = f.read()
+        i = tail.rfind(CONFIG_MARK)
+        if i < 0:
+            return {}
+        d = json.loads(tail[i + len(CONFIG_MARK):].split(b"\n", 1)[0])
+        return {CONFIG_KEYS[k]: str(v) for k, v in d.items() if k in CONFIG_KEYS and v is not None}
+    except (OSError, ValueError):
+        return {}
+
+
 def parse_params(argv: list[str]) -> dict:
     """MSI-like KEY=VALUE parameters and /S (silent) – for GPO, DORA, Intune."""
     out = {}
@@ -1230,7 +1253,7 @@ def install(p: dict) -> None:
         if v is None:
             raise SystemExit("Abgebrochen.")
         conf["url"] = normalize_url(v)
-    if p.get("UPDATEURL"):
+    if "UPDATEURL" in p:                                             # also "" = no updates on purpose
         conf["update_url"] = normalize_url(p["UPDATEURL"])
     elif "update_url" not in conf and not silent:
         v = ask(APP, "Adresse des Update-Servers (UMA), z. B. https://update.<Domain>\nLeer = keine automatischen Updates von VERA-Connect.")
@@ -1357,7 +1380,10 @@ def elevate(args: list[str]) -> bool:
 
 def setup(argv: list[str]) -> None:
     """Double-click / setup parameters: elevate, install, start the tray."""
-    p = parse_params(argv)
+    emb = embedded_config()
+    p = {**emb, **parse_params(argv)}
+    if emb:
+        log("Eingebaute Einstellungen gefunden:", ", ".join(f"{k}={'…' if 'KEY' in k else v}" for k, v in emb.items()))
     if not ctypes.windll.shell32.IsUserAnAdmin():
         if not elevate(argv):
             box("Für die Installation werden Administratorrechte gebraucht.", 0x10)
@@ -1405,6 +1431,7 @@ def main() -> None:
     dg = sub.add_parser("diagnose", help="Verbindung zu VERA/UMA prüfen und Bericht ausgeben")
     dg.add_argument("--out", default="", help="Bericht zusätzlich in diese Datei schreiben")
     sub.add_parser("version")
+    sub.add_parser("embedded", help="eingebaute Einstellungen dieser EXE anzeigen")
     sub.add_parser("configure")
     g = sub.add_parser("upgrade", help=argparse.SUPPRESS)
     g.add_argument("--target", required=True)
@@ -1434,6 +1461,9 @@ def main() -> None:
         print(rep)
         if a.out:
             open(a.out, "w", encoding="utf-8-sig").write(rep)
+    elif a.cmd == "embedded":
+        e = embedded_config()
+        print(json.dumps({k: ("…" if "KEY" in k and v else v) for k, v in e.items()}, ensure_ascii=False) if e else "keine eingebauten Einstellungen")
     elif a.cmd == "version":
         print(VERSION)
     elif a.cmd == "configure":
