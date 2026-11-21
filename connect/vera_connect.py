@@ -42,7 +42,7 @@ import urllib.request
 
 import ed25519
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -988,7 +988,8 @@ class Agent:
 
     def loop(self) -> None:
         log(f"{APP} {VERSION} startet (Daten: {DATA}{', SIMULATION' if SIMULATE else ''})")
-        set_status(state="start", message="", tunnel=self.state.get("tunnel"))
+        set_status(state="start", message="", tunnel=self.state.get("tunnel"), vera=self.conf.get("url", ""),
+                   uma=self.conf.get("update_url", ""))
         while not STOP.is_set():
             try:
                 if take_flag("refresh.flag"):
@@ -1012,6 +1013,93 @@ class Agent:
                     break
                 STOP.wait(1)
         log(f"{APP} beendet")
+
+
+def diagnose(data: str | None = None) -> str:
+    """Connection check step by step (name → port → certificate → answer of VERA/UMA) plus status and the end of the
+    log. Runs as normal user (tray) or admin – it only reads status.json/connect.log and the addresses in it."""
+    from urllib.parse import urlsplit
+    d = data or DATA
+    out = [f"VERA-Connect {VERSION} – Diagnose {time.strftime('%d.%m.%Y %H:%M:%S')}",
+           f"Rechner: {os.environ.get('COMPUTERNAME', socket.gethostname())} · Benutzer: {os.environ.get('USERNAME', '')}", ""]
+    try:
+        st = json.load(open(os.path.join(d, "status.json"), encoding="utf-8"))
+    except (OSError, ValueError):
+        st = {}
+    conf = load("config.json") if os.access(os.path.join(d, "config.json"), os.R_OK) else {}
+    targets = [("VERA", conf.get("url") or st.get("vera") or ""), ("UMA", conf.get("update_url") or st.get("uma") or "")]
+    out.append(f"Dienst: Zustand „{st.get('state', '?')}“ · {st.get('message') or ''}")
+    if st.get("last_error"):
+        out.append(f"Letzter Fehler des Dienstes: {st['last_error']}")
+    out.append("")
+    for name, base in targets:
+        if not base:
+            out.append(f"{name}: keine Adresse eingetragen")
+            continue
+        u = urlsplit(base)
+        host, port = u.hostname or "", u.port or (443 if u.scheme == "https" else 80)
+        out.append(f"── {name}: {base}")
+        try:
+            ips = sorted({a[4][0] for a in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
+            out.append(f"  1. Name aufgelöst: {', '.join(ips)}")
+        except OSError as e:
+            out.append(f"  1. Name NICHT auflösbar: {e}  → DNS prüfen")
+            continue
+        try:
+            t0 = time.time()
+            socket.create_connection((host, port), timeout=10).close()
+            out.append(f"  2. Port {port} erreichbar ({int((time.time() - t0) * 1000)} ms)")
+        except OSError as e:
+            out.append(f"  2. Port {port} NICHT erreichbar: {e}  → Weiterleitung/Firewall/Proxy prüfen")
+            continue
+        if u.scheme == "https":
+            raw = ssl.create_default_context()
+            raw.check_hostname, raw.verify_mode = False, ssl.CERT_NONE
+            try:
+                with socket.create_connection((host, port), timeout=10) as sk, raw.wrap_socket(sk, server_hostname=host) as tl:
+                    der = tl.getpeercert(binary_form=True) or b""
+                subj, iss = _cert_names(ssl.DER_cert_to_PEM_cert(der))
+                cn = lambda x: ", ".join(v for rdn in (x or ()) for k, v in rdn if k in ("commonName", "organizationName"))  # noqa: E731
+                out.append(f"  3. Zertifikat: {cn(subj)} · ausgestellt von {cn(iss)}")
+                plain = ssl.create_default_context()
+                try:
+                    with socket.create_connection((host, port), timeout=10) as sk, plain.wrap_socket(sk, server_hostname=host):
+                        pass
+                    out.append("     Prüfung (OpenSSL): in Ordnung")
+                except ssl.SSLError as e:
+                    out.append(f"     Prüfung (OpenSSL): {getattr(e, 'verify_message', e)}")
+                    if getattr(e, "verify_code", 0) in (2, 20, 21):
+                        out.append("     → der Server schickt die Zertifikatskette unvollständig (am Proxy „fullchain“ eintragen)")
+                chain = windows_chain(der, host)
+                out.append(f"     Prüfung (Windows): {'vertrauenswürdig, Kette mit ' + str(len(chain)) + ' Zertifikat(en)' if chain else 'NICHT vertrauenswürdig'}")
+            except (OSError, ssl.SSLError, ValueError) as e:
+                out.append(f"  3. TLS-Fehler: {e}")
+        path = "/.well-known/sysrix-app" if name == "VERA" else "/u/info"
+        try:
+            ctx = _ssl
+            try:
+                r = urllib.request.urlopen(base.rstrip("/") + path, timeout=15, context=ctx)
+            except urllib.error.URLError as e:
+                if isinstance(e, urllib.error.HTTPError) or not _is_chain_error(e) or not fetch_missing_intermediate(base):
+                    raise
+                r = urllib.request.urlopen(base.rstrip("/") + path, timeout=15, context=_ssl)
+            body = r.read(400)
+            try:
+                info = json.loads(body)
+                out.append(f"  4. Antwort: {info.get('name', '?')} {info.get('version', '')} – in Ordnung")
+            except ValueError:
+                out.append(f"  4. Antwort ist kein JSON (Anmeldeseite/Proxy davor?): {body[:120]!r}")
+        except urllib.error.HTTPError as e:
+            out.append(f"  4. Antwort HTTP {e.code} {e.reason}")
+        except (OSError, ValueError) as e:
+            out.append(f"  4. Keine Antwort: {explain(e)}")
+        out.append("")
+    try:
+        lines = open(os.path.join(d, "connect.log"), encoding="utf-8", errors="replace").read().splitlines()[-40:]
+        out += ["── Protokoll (letzte 40 Zeilen)", *lines]
+    except OSError as e:
+        out.append(f"Protokoll nicht lesbar: {e}")
+    return "\n".join(out)
 
 
 def internet_ok() -> bool:
@@ -1291,6 +1379,8 @@ def main() -> None:
     u = sub.add_parser("uninstall")
     u.add_argument("--silent", action="store_true")
     sub.add_parser("status")
+    dg = sub.add_parser("diagnose", help="Verbindung zu VERA/UMA prüfen und Bericht ausgeben")
+    dg.add_argument("--out", default="", help="Bericht zusätzlich in diese Datei schreiben")
     sub.add_parser("version")
     sub.add_parser("configure")
     g = sub.add_parser("upgrade", help=argparse.SUPPRESS)
@@ -1312,6 +1402,15 @@ def main() -> None:
         import winservice
         print(winservice.status())
         print(json.dumps(load("status.json"), indent=2, ensure_ascii=False))
+    elif a.cmd == "diagnose":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+        rep = diagnose()
+        print(rep)
+        if a.out:
+            open(a.out, "w", encoding="utf-8-sig").write(rep)
     elif a.cmd == "version":
         print(VERSION)
     elif a.cmd == "configure":

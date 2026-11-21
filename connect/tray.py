@@ -31,7 +31,7 @@ NIIF_INFO, NIIF_WARNING = 1, 2
 MF_STRING, MF_GRAYED, MF_SEPARATOR = 0, 1, 0x800
 TPM_RETURNCMD, TPM_RIGHTBUTTON = 0x100, 0x2
 IMAGE_ICON, LR_LOADFROMFILE = 1, 0x10
-CMD_STATUS, CMD_REFRESH, CMD_LOG, CMD_SETTINGS, CMD_EXIT, CMD_CONNECT, CMD_DISCONNECT = 1, 2, 3, 4, 5, 6, 7
+CMD_STATUS, CMD_REFRESH, CMD_LOG, CMD_SETTINGS, CMD_EXIT, CMD_CONNECT, CMD_DISCONNECT, CMD_DIAG = 1, 2, 3, 4, 5, 6, 7, 8
 
 LRESULT = ctypes.c_ssize_t
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
@@ -300,6 +300,7 @@ class Tray:
         user32.AppendMenuW(m, MF_STRING | (0 if st["shown"] != "dead" else MF_GRAYED), CMD_REFRESH, "Konfiguration neu von VERA holen")
         user32.AppendMenuW(m, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(m, MF_STRING, CMD_STATUS, "Status anzeigen …")
+        user32.AppendMenuW(m, MF_STRING, CMD_DIAG, "Verbindung prüfen (Bericht auf den Desktop) …")
         user32.AppendMenuW(m, MF_STRING, CMD_LOG, "Protokoll öffnen")
         user32.AppendMenuW(m, MF_STRING, CMD_SETTINGS, "Einstellungen … (Administrator)")
         user32.AppendMenuW(m, MF_SEPARATOR, 0, None)
@@ -321,7 +322,7 @@ class Tray:
 
     def command(self, cmd: int):
         if cmd == CMD_STATUS:
-            user32.MessageBoxW(None, details(read_status(self.data)), "VERA-Connect", 0x40)
+            user32.MessageBoxW(None, details(read_status(self.data)) + "\n\n(Strg+C kopiert diese Meldung)", "VERA-Connect", 0x40)
         elif cmd == CMD_CONNECT:
             self.flag("connect.flag", "Verbindet …")
         elif cmd == CMD_DISCONNECT:
@@ -329,7 +330,9 @@ class Tray:
         elif cmd == CMD_REFRESH:
             self.flag("refresh.flag", "Holt die Konfiguration neu von VERA.")
         elif cmd == CMD_LOG:
-            subprocess.Popen(stdin=subprocess.DEVNULL, args=["notepad.exe", os.path.join(self.data, "connect.log")], creationflags=0x08000000)
+            self.open_log()
+        elif cmd == CMD_DIAG:
+            self.diagnose()
         elif cmd == CMD_SETTINGS:
             compiled = "__compiled__" in vars(sys.modules["__main__"]) or getattr(sys, "frozen", False)
             exe = os.path.abspath(sys.argv[0]) if compiled else sys.executable
@@ -337,6 +340,53 @@ class Tray:
             shell32.ShellExecuteW(None, "runas", exe, args, None, 1)
         elif cmd == CMD_EXIT:
             user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+
+    def open_text(self, text: str, name: str, desktop: bool = False) -> str:
+        """Write text to a file the user owns (Desktop or %TEMP%) and open it with the default editor."""
+        base = os.path.join(os.path.expanduser("~"), "Desktop") if desktop else tempfile.gettempdir()
+        if desktop and not os.path.isdir(base):
+            base = tempfile.gettempdir()
+        path = os.path.join(base, name)
+        with open(path, "w", encoding="utf-8-sig", newline="\r\n") as f:
+            f.write(text)
+        os.startfile(path)                                     # noqa: S606 – default editor of the user
+        return path
+
+    def open_log(self):
+        try:
+            with open(os.path.join(self.data, "connect.log"), encoding="utf-8", errors="replace") as f:
+                text = f.read()[-200_000:]
+            self.open_text(text, "VERA-Connect-Protokoll.txt")
+        except OSError as e:
+            user32.MessageBoxW(None, f"Das Protokoll lässt sich nicht öffnen:\n{e}\n\nDatei: {os.path.join(self.data, 'connect.log')}",
+                               "VERA-Connect", 0x30)
+
+    def diagnose(self):
+        """Connection check in the background, report on the desktop + clipboard."""
+        self.balloon("VERA-Connect", "Prüfe die Verbindung zu VERA … (bis zu einer Minute)")
+
+        def work():
+            try:
+                main = sys.modules["__main__"]
+                fn = getattr(main, "diagnose", None)
+                if fn is None:
+                    import vera_connect
+                    fn = vera_connect.diagnose
+                text = fn(self.data)
+            except Exception as e:  # noqa: BLE001
+                text = f"Diagnose fehlgeschlagen: {e!r}"
+            try:
+                subprocess.run(["clip.exe"], input=text.encode("utf-16-le"), creationflags=0x08000000, timeout=20)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            try:
+                path = self.open_text(text, f"VERA-Connect-Diagnose-{time.strftime('%Y%m%d-%H%M')}.txt", desktop=True)
+                self.balloon("VERA-Connect", f"Bericht gespeichert und in die Zwischenablage kopiert:\n{os.path.basename(path)}")
+            except OSError as e:
+                user32.MessageBoxW(None, text[:3000] + f"\n\n(Datei ging nicht: {e})", "VERA-Connect – Diagnose", 0x40)
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         if msg == WM_APP_TRAY:

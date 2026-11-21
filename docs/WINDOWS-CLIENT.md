@@ -74,6 +74,8 @@ Menü: **Verbinden / Trennen** (Trennen nur, wenn in VERA erlaubt – Schalter u
 
 ## Fehlersuche
 
+Im Tray: **„Verbindung prüfen“** testet Schritt für Schritt Namensauflösung, Port, Zertifikat (OpenSSL und Windows) und die Antwort von VERA und UMA. Der Bericht – mit den letzten Protokollzeilen – landet als Textdatei auf dem Desktop und in der Zwischenablage. Ohne Tray: `vera-connect.exe diagnose --out bericht.txt`.
+
 | Meldung im Tray (Status) bzw. in `C:\ProgramData\VERA-Connect\connect.log` | Ursache · Lösung |
 | --- | --- |
 | **Zertifikat von VERA nicht prüfbar (unable to get local issuer certificate)** | Der Server/Reverse-Proxy schickt nur sein eigenes Zertifikat ohne Zwischenzertifikat. Browser gleichen das aus, Programme nicht. VERA-Connect ≥ 1.1.1 lädt die fehlenden Zwischenzertifikate dann selbst nach (die Prüfung bleibt streng – nur gegen bereits vertrauenswürdige Wurzeln). **Richtig beheben:** am Reverse-Proxy die vollständige Kette (*fullchain*) hinterlegen. Prüfen: `openssl s_client -connect <VERA_EXTERN>:443 -servername <VERA_EXTERN> -showcerts` muss mehr als ein Zertifikat zeigen |
