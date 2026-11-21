@@ -42,7 +42,7 @@ import urllib.request
 
 import ed25519
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -310,6 +310,36 @@ def _cert_names(pem: str) -> tuple:
         os.remove(path)
 
 
+def windows_chain(der: bytes, host: str) -> list[str]:
+    """Ask the Windows certificate engine (the one browsers use) to build the chain for the server certificate.
+    Windows fetches missing intermediates and – if needed – the root via its automatic root update, which a service
+    using OpenSSL never triggers. Only if Windows reports the chain as trusted are its certificates (intermediates and
+    root) handed to OpenSSL; the host name is still checked by Python afterwards."""
+    if not WIN or not der:
+        return []
+    fd, path = tempfile.mkstemp(suffix=".cer")
+    with os.fdopen(fd, "wb") as f:
+        f.write(der)
+    try:
+        c, out = powershell(f"""
+$c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 '{path}'
+$ch = New-Object Security.Cryptography.X509Certificates.X509Chain
+$ch.ChainPolicy.RevocationMode = 'NoCheck'
+$ch.ChainPolicy.UrlRetrievalTimeout = [TimeSpan]::FromSeconds(30)
+$ok = $ch.Build($c)
+"OK=$ok"
+$ch.ChainElements | Select-Object -Skip 1 | ForEach-Object {{ 'CERT=' + [Convert]::ToBase64String($_.Certificate.RawData) }}
+$ch.ChainStatus | ForEach-Object {{ 'STATUS=' + $_.Status + ' ' + ($_.StatusInformation -replace '\\s+', ' ') }}
+""", 120)
+    finally:
+        os.remove(path)
+    lines = out.splitlines()
+    if "OK=True" not in lines:
+        log(f"Windows vertraut dem Zertifikat von {host} nicht:", "; ".join(x[7:] for x in lines if x.startswith("STATUS="))[:300] or out[-300:])
+        return []
+    return [ssl.DER_cert_to_PEM_cert(base64.b64decode(x[5:])) for x in lines if x.startswith("CERT=")]
+
+
 def fetch_missing_intermediate(url: str) -> bool:
     """The server sends only its own certificate (chain incomplete). Browsers fill the gap themselves – we do the same:
     follow the issuer addresses (AIA) upwards, at most 4 steps, and load the intermediates. A self-signed root found
@@ -325,7 +355,10 @@ def fetch_missing_intermediate(url: str) -> bool:
     with socket.create_connection((host, port), timeout=15) as sock, raw.wrap_socket(sock, server_hostname=host) as t:
         der = t.getpeercert(binary_form=True) or b""
     loaded = []
-    for _ in range(4):
+    for pem in windows_chain(der, host):                            # first: let Windows decide (like the browser)
+        _ssl.load_verify_locations(cadata=pem)
+        loaded.append(("Windows", pem))
+    for _ in range(0 if loaded else 4):
         issuer = _aia_issuer_url(der)
         if not issuer:
             break
