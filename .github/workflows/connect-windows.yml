@@ -1,7 +1,8 @@
 # Baut VERA-Connect für Windows als eine Datei (Nuitka – kein Python nötig) und testet es auf einem frischen Windows:
 # VERA + nachgebaute OPNsense starten, Setup still mit Parametern installieren, Rechner in VERA freigeben,
 # prüfen, dass WireGuard (offizielles MSI) installiert, der Tunnel als Dienst eingerichtet und der WireGuard-Manager aus ist,
-# Tray-Selbsttest, wieder entfernen. Ergebnis: Release „connect-windows“ mit VERA-Connect-Setup.exe.
+# eigenen Tunnel importieren (zweiter echter Tunnel-Dienst), Sicherung in VERA anlegen, löschen + wiederherstellen,
+# Tray- und Fenster-Selbsttest, wieder entfernen. Ergebnis: Release „connect-windows“ mit VERA-Connect-Setup.exe.
 name: VERA-Connect Windows
 
 on:
@@ -34,7 +35,8 @@ jobs:
           $v = (Select-String -Path connect/vera_connect.py -Pattern '^VERSION = "(.*)"').Matches[0].Groups[1].Value
           "VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           $env:PYTHONPATH = "connect"
-          python -m nuitka --onefile --assume-yes-for-downloads --include-module=winservice --include-module=tray --include-module=ed25519 `
+          python -m nuitka --onefile --assume-yes-for-downloads --enable-plugin=tk-inter --include-module=winservice --include-module=tray `
+            --include-module=ed25519 --include-module=wgconf --include-module=qrdecode --include-module=gui `
             --windows-console-mode=attach --windows-icon-from-ico=connect/vera-connect.ico --python-flag=no_asserts --python-flag=no_docstrings `
             --windows-company-name=SysriX --windows-product-name="VERA-Connect" --windows-file-description="VERA-Connect (WireGuard-Verbindung zu VERA)" `
             --windows-file-version=$v --windows-product-version=$v --output-filename=VERA-Connect-Setup.exe --output-dir=dist connect/vera_connect.py
@@ -101,6 +103,39 @@ jobs:
           sc.exe query 'WireGuardTunnel$CI'
           if ($LASTEXITCODE -ne 0) { Get-Content "$env:ProgramData\VERA-Connect\connect.log" -Tail 15; throw "Tunnel wurde nicht wiederhergestellt" }
           Write-Host "::notice title=Test::Tunnel nach Löschen wiederhergestellt"
+          "--- Eigener Tunnel (Import) + Sicherung in VERA"
+          $vc = "$env:ProgramFiles\VERA-Connect\vera-connect.exe"
+          $keys = python -c "import sys; sys.path.insert(0, 'connect'); import wgconf; a = wgconf.keypair(); b = wgconf.keypair(); print(a[0] + ' ' + b[1])"
+          $k = $keys.Trim().Split(' ')
+          "[Interface]`nPrivateKey = $($k[0])`nAddress = 10.99.0.2/32`n`n[Peer]`nPublicKey = $($k[1])`nAllowedIPs = 10.99.0.0/24`nEndpoint = 127.0.0.1:51999`n" | Out-File -Encoding ascii eigen.conf
+          & $vc tunnel import eigen.conf Eigen --connect
+          if ($LASTEXITCODE -ne 0) { throw "Import des eigenen Tunnels" }
+          $end = (Get-Date).AddSeconds(90)
+          while ((Get-Date) -lt $end -and -not ((sc.exe query 'WireGuardTunnel$Eigen') -match 'RUNNING')) { Start-Sleep 3 }
+          if (-not ((sc.exe query 'WireGuardTunnel$Eigen') -match 'RUNNING')) { throw "Eigener Tunnel-Dienst läuft nicht" }
+          if (-not ((sc.exe query 'WireGuardTunnel$CI') -match 'RUNNING')) { throw "VERA-Tunnel läuft nicht mehr neben dem eigenen" }
+          & $vc tunnel list
+          Write-Host "::notice title=Test::Eigener Tunnel importiert, läuft neben dem VERA-Tunnel"
+          $env:VC_BACKUP_PASSPHRASE = "ci-geheim-123"
+          & $vc backup create --comment CI
+          if ($LASTEXITCODE -ne 0) { throw "Sicherung anlegen" }
+          $list = (& $vc backup list | Out-String) | ConvertFrom-Json
+          $bid = $list.backups[0].id
+          if (-not $bid -or $list.backups[0].meta.tunnels -notcontains 'Eigen') { throw "Sicherung nicht in VERA: $($list | ConvertTo-Json -Depth 5)" }
+          & $vc tunnel delete Eigen
+          $end = (Get-Date).AddSeconds(60)
+          while ((Get-Date) -lt $end -and ((sc.exe query 'WireGuardTunnel$Eigen') -match 'RUNNING|STOP')) { Start-Sleep 2 }
+          sc.exe query 'WireGuardTunnel$Eigen'
+          if ($LASTEXITCODE -eq 0) { throw "Eigener Tunnel nach Löschen noch da" }
+          & $vc backup restore $bid
+          if ($LASTEXITCODE -ne 0) { throw "Wiederherstellen" }
+          $end = (Get-Date).AddSeconds(90)
+          while ((Get-Date) -lt $end -and -not ((sc.exe query 'WireGuardTunnel$Eigen') -match 'RUNNING')) { Start-Sleep 3 }
+          if (-not ((sc.exe query 'WireGuardTunnel$Eigen') -match 'RUNNING')) { throw "Eigener Tunnel nach Wiederherstellen nicht da" }
+          Write-Host "::notice title=Test::Sicherung in VERA angelegt, gelöscht, wiederhergestellt"
+          $g = Start-Process $vc -ArgumentList "gui","--selbsttest","3" -PassThru -Wait -NoNewWindow
+          if ($g.ExitCode -ne 0) { throw "Fenster-Selbsttest" }
+          Write-Host "::notice title=Test::Fenster-Selbsttest ok"
           "--- Tray"
           $run = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run').'VERA-Connect'; "Autostart: $run"
           if ($run -notmatch 'vera-connect\.exe" tray') { throw "Tray-Autostart fehlt" }
@@ -116,6 +151,8 @@ jobs:
           if ($LASTEXITCODE -eq 0) { throw "Dienst noch da" }
           sc.exe query 'WireGuardTunnel$CI'
           if ($LASTEXITCODE -eq 0) { throw "Tunnel noch da" }
+          sc.exe query 'WireGuardTunnel$Eigen'
+          if ($LASTEXITCODE -eq 0) { throw "Eigener Tunnel noch da" }
           Write-Host "::notice title=Test::Entfernt – alles ok"
           exit 0
 
@@ -132,4 +169,4 @@ jobs:
         run: |
           gh release view connect-windows >/dev/null 2>&1 || gh release create connect-windows --title "VERA-Connect (Windows)" --notes "Wird automatisch gebaut."
           gh release upload connect-windows dist/VERA-Connect-Setup.exe --clobber
-          gh release edit connect-windows --notes "VERA-Connect ${VERSION} für Windows – automatisch gebaut und auf einem frischen Windows getestet (Installation, Freigabe, WireGuard, Tunnel, Tray, Entfernen)."
+          gh release edit connect-windows --notes "VERA-Connect ${VERSION} für Windows – automatisch gebaut und auf einem frischen Windows getestet (Installation, Freigabe, WireGuard, Tunnel, eigener Tunnel per Import, Sicherung in VERA + Wiederherstellen, Tray, Fenster, Entfernen)."

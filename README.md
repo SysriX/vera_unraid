@@ -6,6 +6,7 @@
 
 `ghcr.io/sysrix/vera:latest`
 
+> **Stand 1.3.0:** Sicherungen von VERA-Connect 1.2 (verschlüsselt auf dem Rechner, Versionsliste, Übertragen auf einen anderen Rechner), eigene Tunnel der Rechner in den Details sichtbar.
 > **Stand 1.2.0:** Windows-Client **VERA-Connect** und Seite „Rechner“ (Freigabe) – Ablauf getestet, WireGuard dabei simuliert; die EXE wird bei GitHub auf frischem Windows mit echtem WireGuard getestet.
 > **Stand 1.1.0:** Kopplung mit MIRA (Erkennung, API-Schlüssel, Plugin) – getestet mit MIRA 0.3.0.
 > **Stand 1.0.0:** vollständig gegen eine nachgebaute OPNsense-API getestet (Import, Anlegen, Ausgabe, Standortverbindung, Entfernen). **Gegen eine echte OPNsense noch ungetestet** – vor allem die Firewall-Automation (Aliase/Regeln) und das Format von „Status“ je nach OPNsense-Version.
@@ -20,7 +21,7 @@
 | **Konfiguration ausgeben** | *Ansehen* (Schlüssel verborgen, auch für Nur-Lesen), *Konfiguration + QR-Code*, *Kopieren*, *Herunterladen (.conf)*, *QR als Bild (PNG)*, *Freigabelink* (ohne Anmeldung, 1 h – 7 Tage, 1×/3×/beliebig oft, widerrufbar) |
 | **Vorhandene .conf übernehmen** | Datei hochladen oder einfügen: gibt es den Zugang schon, wird der private Schlüssel nachgetragen – sonst wird er angelegt und aktiviert |
 | **Pflege** | Name, Besitzer, Gerät, Notiz, Instanz, Tunnel-IP, AllowedIPs/DNS im Gerät, Keepalive, aktiv/aus, **neue Schlüssel**, löschen – Änderungen gehen direkt an die OPNsense |
-| **Rechner (VERA-Connect)** | Windows-Rechner holen sich ihre Konfiguration selbst: Freigabeliste mit Rechner/Benutzer/Windows, Freigeben mit neuem oder vorhandenem Zugang, Sperren, Tunnelstatus und Versionen je Rechner, optionaler Anmelde-Schlüssel, „Trennen erlaubt“. Siehe [docs/WINDOWS-CLIENT.md](docs/WINDOWS-CLIENT.md) |
+| **Rechner (VERA-Connect)** | Windows-Rechner holen sich ihre Konfiguration selbst: Freigabeliste mit Rechner/Benutzer/Windows, Freigeben mit neuem oder vorhandenem Zugang, Sperren, Tunnelstatus und Versionen je Rechner, optionaler Anmelde-Schlüssel, „Trennen erlaubt“, eigene Tunnel des Rechners, Sicherungen (Liste, löschen, auf anderen Rechner übertragen, Anzahl einstellbar). Der Client hat ein Fenster mit Live-Anzeige, mehrere Tunnel, Import aus `.conf`/QR-Bild. Siehe [docs/WINDOWS-CLIENT.md](docs/WINDOWS-CLIENT.md) |
 | **Status** | online/zuletzt online, Datenmenge, letzte Gegenstelle |
 | **Standortverbindungen** | zwei OPNsense per eigener WireGuard-Instanz koppeln, inkl. Aliasen und Firewall-Regeln (mit Sicherungspunkt) – bestehende Zugänge bleiben unberührt. Siehe [docs/SITE-TO-SITE.md](docs/SITE-TO-SITE.md) |
 | **Benutzer** | Lesen · Bearbeiten · Admin, Passwörter mit Argon2 |
@@ -86,8 +87,8 @@ Technik: [SysriX-Verbindungsstandard](https://github.com/SysriX/mira_unraid/blob
 | `app/wgcore/` | Kern (OPNsense-API, Datenbank, Logik, Routen) |
 | `app/web/vera-views.js`, `wireguard.js`, `wireguard.css` | Oberfläche – von VERA selbst **und** vom MIRA-Plugin benutzt |
 | `app/main.py`, `app/core.py` | Anmeldung, Firewalls, Benutzer, Protokoll, Kopplung mit Apps |
-| `app/clients.py` | Rechner mit VERA-Connect: `/client/…` (öffentlich, signiert) und `/api/clients` |
-| `connect/` | VERA-Connect für Windows (Dienst, Tray, Ed25519); gebaut von `.github/workflows/connect-windows.yml` |
+| `app/clients.py` | Rechner mit VERA-Connect: `/client/…` (öffentlich, signiert, inkl. `/client/backup/…`) und `/api/clients` |
+| `connect/` | VERA-Connect für Windows (Dienst, Tray, Fenster `gui.py`, QR-Leser `qrdecode.py`, Konfiguration/Schlüssel/Sicherungs-Verschlüsselung `wgconf.py`, Ed25519); gebaut von `.github/workflows/connect-windows.yml` |
 | `mira-plugin/vera/` | Plugin für MIRA; nach Änderungen an der Oberfläche `python tools/build_mira_plugin.py` |
 
 ```bash

@@ -177,7 +177,41 @@ function veraViews(ctx) {
     if (r) ctx.rerender();
   }
 
-  function clientDetails(c) {
+  const OWN_STATE = { up: ["verbunden", "ok"], idle: ["aktiv", "ok"], connecting: ["verbindet", "warn"], down: ["keine Verbindung", "bad"],
+    missing: ["fehlt", "bad"], off: ["getrennt", ""] };
+
+  async function backupsBox(c, box, others) {
+    const a = ctx.can("admin");
+    let d;
+    try { d = await ctx.api("GET", `/api/clients/${c.id}/backups`); } catch (e) { leeren(box, h("p", { class: "rot klein-t" }, String(e.message || e))); return; }
+    const copy = async b => {
+      const sel = auswahl("target", others.map(o => [o.id, `${o.hostname || o.machine_id.slice(0, 12)} (${o.username || "–"})`]), others[0] && others[0].id);
+      const r = await dialog("Sicherung auf anderen Rechner übertragen", h("div", {},
+        h("p", { class: "klein-t" }, `Sicherung vom ${b.created_local} (${(b.meta.tunnels || []).join(", ") || "keine eigenen Tunnel"}) bekommt der gewählte Rechner zusätzlich. Wiederherstellen kann er sie nur mit dem Kennwort, das beim Sichern vergeben wurde.`),
+        feld("Ziel-Rechner", sel)), [["Abbrechen", null],
+        ["Übertragen", () => versuch(() => ctx.api("POST", `/api/clients/${c.id}/backups/${b.id}/copy`, { target: Number(sel.value) }), "Übertragen"), "p"]]);
+      if (r) backupsBox(c, box, others);
+    };
+    const del = async b => {
+      if (!(await bestaetigen(`Sicherung vom ${b.created_local} löschen?`, "Löschen"))) return;
+      await versuch(() => ctx.api("DELETE", `/api/clients/${c.id}/backups/${b.id}`), "Gelöscht");
+      backupsBox(c, box, others);
+    };
+    leeren(box,
+      h("p", { class: "leise klein-t" }, `VERA-Connect sichert eigene Tunnel und Einstellungen verschlüsselt (Kennwort nur auf dem Rechner bekannt). Es bleiben die letzten ${d.keep} Sicherungen je Rechner.`),
+      tabelle([
+        { t: "Zeitpunkt", w: b => h("span", {}, b.created_local, b.origin ? h("div", { class: "leise klein-t" }, b.origin) : null) },
+        { t: "Eigene Tunnel", w: b => (b.meta.tunnels || []).join(", ") || "–" },
+        { t: "Version", w: b => h("span", { class: "klein-t" }, b.meta.client_version || "") },
+        { t: "Kommentar", w: b => b.meta.comment || "" },
+        { t: "Größe", w: b => groesse(b.size) },
+        { t: "", w: b => a ? h("span", { class: "leiste" },
+          others.length ? h("button", { class: "klein", onclick: e => { e.stopPropagation(); copy(b); } }, "Übertragen …") : null,
+          h("button", { class: "klein gefahr", onclick: e => { e.stopPropagation(); del(b); } }, "Löschen")) : "" }],
+        d.backups, { leer: "Noch keine Sicherungen" }));
+  }
+
+  function clientDetails(c, all) {
     const rep = c.report || {};
     const ts = c.status !== "approved" ? ["–", ""] : TUNNEL_STATE[rep.tunnel_state] || [rep.tunnel_state || "–", ""];
     const a = ctx.can("admin");
@@ -192,6 +226,7 @@ function veraViews(ctx) {
       if (!(await bestaetigen(`${c.hostname} aus der Liste entfernen? Meldet er sich wieder, steht er erneut zur Freigabe an. Der WireGuard-Zugang bleibt bestehen.`, "Entfernen"))) return false;
       await versuch(() => ctx.api("DELETE", `/api/clients/${c.id}`), "Entfernt"); ctx.rerender();
     }, "gefahr"]);
+    const bbox = h("div", {}, h("p", { class: "leise klein-t" }, "Lade …"));
     dialog(`Rechner ${c.hostname}`, h("div", {},
       h("div", { class: "raster" },
         feld("Status", h("div", {}, marke(...CLIENT_STATE[c.status]), c.note ? h("div", { class: "klein-t" }, c.note) : null)),
@@ -201,10 +236,16 @@ function veraViews(ctx) {
         feld("WireGuard-Zugang", h("div", {}, c.peer_name || "–", c.tunnel ? ` · Tunnel „${c.tunnel}“` : "")),
         feld("Zuletzt gemeldet", h("div", {}, `${datum(c.last_seen)} · ${c.last_ip}`))),
       rep.rx !== undefined ? h("p", { class: "klein-t leise" }, `Daten: ↓ ${groesse(rep.rx || 0)} · ↑ ${groesse(rep.tx || 0)}`) : null,
+      (rep.tunnels || []).length > 1 || (rep.tunnels || []).some(t => t.source !== "vera") ? h("div", {},
+        h("h4", {}, "Tunnel auf dem Rechner"),
+        tabelle([{ t: "Name", w: t => h("span", {}, t.default ? "★ " : "", t.name) }, { t: "Herkunft", w: t => t.source === "vera" ? "VERA" : "eigener (Import/QR/von Hand)" },
+          { t: "Zustand", w: t => t.on ? marke(...(OWN_STATE[t.state] || [t.state, ""])) : marke("getrennt", "") }], rep.tunnels)) : null,
       rep.error ? h("pre", {}, rep.error) : null,
       h("p", { class: "leise klein-t" }, `Kennung ${c.machine_id} · Geräteschlüssel ${c.key_fingerprint}` + (c.approved_by ? ` · freigegeben von ${c.approved_by} am ${datum(c.approved_at)}` : "")),
+      h("h4", {}, `Sicherungen von VERA-Connect${c.backups ? ` (${c.backups})` : ""}`), bbox,
       h("h4", {}, "Verlauf"),
       tabelle([{ t: "Zeit", w: x => datum(x.t) }, { t: "Ereignis", w: x => x.e }], c.history.slice(0, 15), { leer: "–" })), kn);
+    backupsBox(c, bbox, (all || []).filter(o => o.id !== c.id && o.status === "approved"));
   }
 
   async function installerCard() {
@@ -248,10 +289,15 @@ function veraViews(ctx) {
       h("span", { class: "klein-t" }, "Anmelde-Schlüssel: ", d.enroll_key ? h("code", {}, d.enroll_key) : h("span", { class: "leise" }, "keiner (jeder Rechner kann sich zur Freigabe melden)")),
       h("button", { class: "klein", onclick: async () => { await versuch(() => ctx.api("PUT", "/api/clients/settings", { enroll_key: "new" }), "Neuer Anmelde-Schlüssel"); ctx.rerender(); } }, d.enroll_key ? "Neu erzeugen" : "Erzeugen"),
       d.enroll_key ? h("button", { class: "klein", onclick: async () => { await versuch(() => ctx.api("PUT", "/api/clients/settings", { enroll_key: "" }), "Anmelde-Schlüssel entfernt"); ctx.rerender(); } }, "Entfernen") : null,
-      haken("Benutzer darf den Tunnel trennen", d.allow_disconnect, null, "allow_disconnect").el) : null;
+      haken("Benutzer darf den Tunnel trennen", d.allow_disconnect, null, "allow_disconnect").el,
+      h("span", { class: "klein-t" }, "Sicherungen je Rechner behalten:"),
+      h("input", { type: "number", min: 1, max: 200, value: d.backup_keep || 20, style: { width: "5em" }, onchange: async e => {
+        await versuch(() => ctx.api("PUT", "/api/clients/settings", { backup_keep: Number(e.target.value) }), "Gespeichert");
+      } })) : null;
     if (keyLine) keyLine.querySelector("input[type=checkbox]").addEventListener("change", async e => {
       await versuch(() => ctx.api("PUT", "/api/clients/settings", { allow_disconnect: e.target.checked }), "Gespeichert");
     });
+    const details = c => clientDetails(c, d.clients);
     const cols = [
       { t: "", w: c => punkt(CLIENT_STATE[c.status][1]) },
       { t: "Rechner", w: c => h("div", {}, h("b", {}, c.hostname || c.machine_id.slice(0, 12)), h("div", { class: "leise klein-t" }, c.domain || "")) },
@@ -260,15 +306,16 @@ function veraViews(ctx) {
       { t: "Tunnel", w: c => c.status === "approved" ? marke(...(TUNNEL_STATE[(c.report || {}).tunnel_state] || ["–", ""])) : "" },
       { t: "Zugang", w: c => c.peer_name || "–" },
       { t: "Versionen", w: c => h("span", { class: "klein-t" }, `${c.client_version || "?"} · WG ${c.wg_version || "–"}`) },
+      { t: "Tunnel/Sicherungen", w: c => h("span", { class: "klein-t" }, `${((c.report || {}).tunnels || []).length || (c.tunnel ? 1 : 0)} · ${c.backups || 0}`) },
       { t: "Zuletzt", w: c => h("span", { class: "klein-t" }, datum(c.last_seen), h("div", { class: "leise" }, c.last_ip)) },
       { t: "", w: c => a && c.status === "pending" ? h("button", { class: "p klein", onclick: e => { e.stopPropagation(); approveDialog(c); } }, "Freigeben") : "" }];
     leeren(main,
       pending.length ? h("div", { class: "karte" }, h("h2", {}, `Freizugebende Rechner (${pending.length})`),
         h("p", { class: "leise klein-t" }, "Diese Rechner haben VERA-Connect installiert und warten. Nach der Freigabe holen sie sich ihre WireGuard-Konfiguration und verbinden sich."),
-        tabelle(cols, pending, { klick: clientDetails })) : null,
+        tabelle(cols, pending, { klick: details })) : null,
       h("div", { class: "karte" }, h("h2", {}, "Rechner mit VERA-Connect"),
         h("p", { class: "leise klein-t" }, "Windows-Rechner holen sich ihre Konfiguration selbst, halten den Tunnel aufrecht und aktualisieren WireGuard. Von außen muss nur der Pfad /client/ erreichbar sein."),
-        keyLine, tabelle(cols, d.clients.filter(c => c.status !== "pending"), { klick: clientDetails, leer: "Noch keine Rechner" })));
+        keyLine, tabelle(cols, d.clients.filter(c => c.status !== "pending"), { klick: details, leer: "Noch keine Rechner" })));
     if (a) main.append(await installerCard());
   } };
 

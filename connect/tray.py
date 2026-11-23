@@ -5,7 +5,9 @@ Replaces the tray of WireGuard. The service runs in session 0 and writes <data>\
 
     icon     VERA shield with a status dot: green = connected · yellow = waiting for approval / connecting
              blue = disconnected by the user · red = no connection / blocked · grey = service not running
-    menu     connect / disconnect (if VERA allows it) · fetch configuration again · status · log · settings (admin) · close
+    menu     open the window (tunnels live, import, backup) · each tunnel on/off · connect default / disconnect all
+             (the VERA tunnel only if VERA allows it) · fetch configuration again · status · check · log · settings (admin) · close
+    double click opens the window
 Commands go to the service as flag files in <data>\\ui (users may write there, nothing else).
 (Window/menu code taken over from the DORA agent.)
 """
@@ -28,10 +30,11 @@ WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_LBUTTONUP = 0x0203, 0x0205, 0x0202
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 1, 2, 4, 0x10
 NIIF_INFO, NIIF_WARNING = 1, 2
-MF_STRING, MF_GRAYED, MF_SEPARATOR = 0, 1, 0x800
+MF_STRING, MF_GRAYED, MF_CHECKED, MF_POPUP, MF_SEPARATOR = 0, 1, 0x8, 0x10, 0x800
 TPM_RETURNCMD, TPM_RIGHTBUTTON = 0x100, 0x2
 IMAGE_ICON, LR_LOADFROMFILE = 1, 0x10
-CMD_STATUS, CMD_REFRESH, CMD_LOG, CMD_SETTINGS, CMD_EXIT, CMD_CONNECT, CMD_DISCONNECT, CMD_DIAG = 1, 2, 3, 4, 5, 6, 7, 8
+CMD_STATUS, CMD_REFRESH, CMD_LOG, CMD_SETTINGS, CMD_EXIT, CMD_CONNECT, CMD_DISCONNECT, CMD_DIAG, CMD_WINDOW = 1, 2, 3, 4, 5, 6, 7, 8, 9
+CMD_TUNNEL = 100                                     # + index of the tunnel
 
 LRESULT = ctypes.c_ssize_t
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
@@ -93,6 +96,9 @@ STATE_TEXT = {"up": "verbunden", "ready": "verbindet …", "down": "keine Verbin
               "start": "startet", "installing": "richtet WireGuard ein", "user_off": "getrennt (von Hand)", "offline": "VERA nicht erreichbar",
               "error": "Fehler", "blocked": "in VERA gesperrt", "denied": "von VERA abgelehnt", "no_url": "Adresse von VERA fehlt",
               "dead": "Dienst läuft nicht"}
+
+
+TUNNEL_TEXT = {"up": "verbunden", "idle": "aktiv", "connecting": "verbindet …", "down": "keine Verbindung", "missing": "fehlt", "off": "getrennt"}
 
 
 # ------------------------------------------------------------------ icons: the VERA shield (app/web/icon.svg) + status dot
@@ -229,8 +235,14 @@ def details(st: dict) -> str:
     lines = [f"Zustand: {STATE_TEXT.get(st['shown'], st['shown'])}"]
     if st.get("message"):
         lines.append(st["message"])
-    lines += [f"Tunnel: {st.get('tunnel') or '–'}",
-              f"Letzter Handshake: {_ago(st.get('last_handshake'))}",
+    tl = st.get("tunnels") or []
+    if tl:
+        for t in tl:
+            lines.append(f"Tunnel {'★ ' if t.get('default') else ''}{t['name']}: {TUNNEL_TEXT.get(t['state'], t['state']) if t['on'] else 'getrennt'}"
+                         + (f" (Handshake {_ago(t.get('last_handshake'))})" if t["on"] and t.get("last_handshake") else ""))
+    else:
+        lines.append(f"Tunnel: {st.get('tunnel') or '–'}")
+    lines += [f"Letzter Handshake: {_ago(st.get('last_handshake'))}",
               f"VERA: {st.get('vera') or '–'} (zuletzt erreicht {_ago(st.get('server_ok'))})"]
     if st.get("update_state"):
         lines.append(f"Updates: {st['update_state']}")
@@ -244,6 +256,7 @@ def details(st: dict) -> str:
 class Tray:
     def __init__(self, data: str):
         self.data, self.st = data, {"shown": None}
+        self.started, self.restarting = time.time(), False
         self.taskbar_created = -1
         hinst = kernel32.GetModuleHandleW(None)
         self._proc = WNDPROC(self._wndproc)
@@ -269,8 +282,27 @@ class Tray:
         self.nid.szInfoTitle, self.nid.szInfo, self.nid.dwInfoFlags = title[:63], text[:255], kind
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
 
+    def restart_if_updated(self, st: dict) -> None:
+        """After a self-update the service reports a new version and the EXE on disk is newer than this process:
+        start the new tray and close this one (once)."""
+        mine = getattr(sys.modules.get("__main__"), "VERSION", None)
+        compiled = "__compiled__" in vars(sys.modules["__main__"]) or getattr(sys, "frozen", False)
+        if self.restarting or not compiled or not mine or not st.get("version") or st["version"] == mine:
+            return
+        exe = os.path.abspath(sys.argv[0])
+        try:
+            if os.path.getmtime(exe) <= self.started:
+                return
+        except OSError:
+            return
+        self.restarting = True
+        subprocess.Popen(f'cmd.exe /c ping -n 4 127.0.0.1 >nul & start "" "{exe}" tray', stdin=subprocess.DEVNULL, close_fds=True,
+                         creationflags=0x00000008 | 0x08000000)
+        user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+
     def refresh(self):
         st = read_status(self.data)
+        self.restart_if_updated(st)
         self.nid.uFlags = NIF_ICON | NIF_TIP
         self.nid.hIcon = icon(st["shown"])
         self.nid.szTip = tip_text(st)
@@ -290,13 +322,24 @@ class Tray:
         m = user32.CreatePopupMenu()
         user32.AppendMenuW(m, MF_STRING | MF_GRAYED, 0, tip_text(st).replace("\n", " · ")[:100])
         user32.AppendMenuW(m, MF_SEPARATOR, 0, None)
-        has_tunnel = bool(st.get("tunnel")) and st["shown"] != "dead"
+        alive = st["shown"] != "dead"
+        user32.AppendMenuW(m, MF_STRING, CMD_WINDOW, "VERA-Connect öffnen …")
+        tl = st.get("tunnels") or []
+        self.menu_tunnels = [t["name"] for t in tl]
+        if len(tl) > 1:
+            sub = user32.CreatePopupMenu()
+            for i, t in enumerate(tl):
+                locked = t["on"] and t["source"] == "vera" and not st.get("allow_disconnect", True)
+                user32.AppendMenuW(sub, MF_STRING | (MF_CHECKED if t["on"] else 0) | (MF_GRAYED if locked or not alive else 0), CMD_TUNNEL + i,
+                                   ("★ " if t.get("default") else "") + t["name"] + (" (VERA)" if t["source"] == "vera" else ""))
+            user32.AppendMenuW(m, MF_POPUP | (0 if alive else MF_GRAYED), sub, "Tunnel")
+        has_tunnel = bool(st.get("tunnel") or tl) and alive
         if st["shown"] == "user_off":
-            user32.AppendMenuW(m, MF_STRING | (0 if has_tunnel else MF_GRAYED), CMD_CONNECT, "Verbinden")
+            user32.AppendMenuW(m, MF_STRING | (0 if has_tunnel else MF_GRAYED), CMD_CONNECT, "Verbinden (Standard-Tunnel)" if len(tl) > 1 else "Verbinden")
         else:
-            allowed = st.get("allow_disconnect", True)
-            user32.AppendMenuW(m, MF_STRING | (0 if has_tunnel and allowed else MF_GRAYED), CMD_DISCONNECT,
-                               "Trennen" if allowed else "Trennen (in VERA nicht erlaubt)")
+            allowed = st.get("allow_disconnect", True) or not any(t["source"] == "vera" for t in tl)
+            user32.AppendMenuW(m, MF_STRING | (0 if has_tunnel else MF_GRAYED), CMD_DISCONNECT,
+                               ("Alle trennen" if len(tl) > 1 else "Trennen") if allowed or len(tl) > 1 else "Trennen (in VERA nicht erlaubt)")
         user32.AppendMenuW(m, MF_STRING | (0 if st["shown"] != "dead" else MF_GRAYED), CMD_REFRESH, "Konfiguration neu von VERA holen")
         user32.AppendMenuW(m, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(m, MF_STRING, CMD_STATUS, "Status anzeigen …")
@@ -321,7 +364,17 @@ class Tray:
             user32.MessageBoxW(None, f"Geht nicht: {e}", "VERA-Connect", 0x30)
 
     def command(self, cmd: int):
-        if cmd == CMD_STATUS:
+        if cmd >= CMD_TUNNEL:
+            names = getattr(self, "menu_tunnels", [])
+            if cmd - CMD_TUNNEL < len(names):
+                n = names[cmd - CMD_TUNNEL]
+                t = next((x for x in self.st.get("tunnels") or [] if x["name"] == n), None)
+                if t:
+                    self.flag(("disconnect@" if t["on"] else "connect@") + n + ".flag", f"{'Trenne' if t['on'] else 'Verbinde'} {n} …")
+            return
+        if cmd == CMD_WINDOW:
+            self.open_window()
+        elif cmd == CMD_STATUS:
             user32.MessageBoxW(None, details(read_status(self.data)) + "\n\n(Strg+C kopiert diese Meldung)", "VERA-Connect", 0x40)
         elif cmd == CMD_CONNECT:
             self.flag("connect.flag", "Verbindet …")
@@ -340,6 +393,14 @@ class Tray:
             shell32.ShellExecuteW(None, "runas", exe, args, None, 1)
         elif cmd == CMD_EXIT:
             user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+
+    def open_window(self):
+        compiled = "__compiled__" in vars(sys.modules["__main__"]) or getattr(sys, "frozen", False)
+        args = [os.path.abspath(sys.argv[0]), "gui", "--data", self.data] if compiled else             [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vera_connect.py"), "gui", "--data", self.data]
+        try:
+            subprocess.Popen(args, stdin=subprocess.DEVNULL, close_fds=True, creationflags=0x00000008 | 0x00000200 | 0x08000000)
+        except OSError as e:
+            user32.MessageBoxW(None, f"Fenster lässt sich nicht öffnen: {e}", "VERA-Connect", 0x30)
 
     def open_text(self, text: str, name: str, desktop: bool = False) -> str:
         """Write text to a file the user owns (Desktop or %TEMP%) and open it with the default editor."""
@@ -394,7 +455,7 @@ class Tray:
             if ev == WM_RBUTTONUP:
                 self.menu()
             elif ev == WM_LBUTTONDBLCLK:
-                self.command(CMD_STATUS)
+                self.command(CMD_WINDOW)
             return 0
         if msg == WM_TIMER:
             self.refresh()

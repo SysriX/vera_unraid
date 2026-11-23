@@ -4,8 +4,11 @@
     VERA-Connect-Setup.exe                                         install (asks for the address of VERA)
     VERA-Connect-Setup.exe /S URL=https://<VERA_EXTERN> ENROLLKEY=vk_… UPDATEURL=https://<UPDATE_URL> [UPDATEKEY=…] [TUNNEL=…]
     vera-connect.exe install --url … [--enroll-key …] [--update-url …] [--update-key …] [--tunnel …] [--silent]
-    vera-connect.exe uninstall | status | version | configure | tray
+    vera-connect.exe uninstall | status | version | configure | tray | gui
     vera-connect.exe run [--data DIR] [--simulate]              foreground (the service runs this); --simulate = no WireGuard changes
+    vera-connect.exe tunnel list|import FILE|import-qr IMAGE|connect|disconnect|default|rename|delete …   (administrator)
+    vera-connect.exe backup create|list|restore ID|delete ID                                            (administrator)
+    vera-connect.exe qr-decode IMAGE                                                                    (any user)
 
 What the service (LocalSystem) does:
   1. device identity: machine id (SMBIOS UUID + MachineGuid + BIOS serial, hashed) and an Ed25519 device key (DPAPI)
@@ -15,7 +18,12 @@ What the service (LocalSystem) does:
   4. watchdog every 30 s: tunnel missing → restore, no handshake for 3 min → restart (with growing pauses)
   5. VERA changes the configuration (new keys, networks) → new configuration is installed automatically
   6. daily: newer WireGuard → install; every 6 h: newer VERA-Connect in UMA (signed) → update itself
-The user may disconnect in the tray (if VERA allows it); it stays off until "Verbinden" or the next restart of Windows.
+Since 1.2: several tunnels – the one from VERA plus own ones (import of a .conf, a QR code image, by hand, from a backup).
+Each can be connected on its own; the default tunnel connects after a restart of Windows. Only one tunnel at a time may take
+all traffic (0.0.0.0/0). The window (`gui`) shows every tunnel live (handshake, endpoint, transfer with rate graph) and
+manages them; changes go to the service as commands in cmd\\ (administrators only). Backups: tunnels + settings,
+sealed with a passphrase, stored in VERA (/client/backup/*), with a list of versions and restore.
+The user may disconnect in the tray (the VERA tunnel only if VERA allows it); it stays off until "Verbinden" or the next restart.
 Standard library only (+ ed25519.py). Windows: service "VeraConnect", data in C:\\ProgramData\\VERA-Connect.
 """
 from __future__ import annotations
@@ -41,8 +49,9 @@ import urllib.error
 import urllib.request
 
 import ed25519
+import wgconf
 
-VERSION = "1.1.5"
+VERSION = "1.2.0"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -143,6 +152,7 @@ def harden() -> None:
     os.makedirs(DATA, exist_ok=True)
     subprocess.run(["icacls.exe", DATA, "/inheritance:r", "/grant:r", f"{SID_SYSTEM}:(OI)(CI)F", f"{SID_ADMINS}:(OI)(CI)F",
                     f"{SID_USERS}:(OI)(CI)RX", "/Q"], stdin=subprocess.DEVNULL, capture_output=True, creationflags=NOWIN)
+    _secure_cmd_dir()
     for sub, users in (("ui", True), ("tunnel", False), ("update", False), ("downloads", False)):
         d = os.path.join(DATA, sub)
         os.makedirs(d, exist_ok=True)
@@ -494,6 +504,8 @@ class WireGuard:
     def __init__(self):
         base = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WireGuard")
         self.exe, self.wg = os.path.join(base, "wireguard.exe"), os.path.join(base, "wg.exe")
+        self._sim: dict[str, str] = {}                     # simulation: tunnel -> RUNNING | STOPPED
+        self._simc: dict[str, list] = {}
 
     def installed(self) -> bool:
         return bool(STATUS.get("sim_wg")) if SIMULATE else os.path.exists(self.exe)
@@ -584,7 +596,7 @@ class WireGuard:
 
     def svc_state(self, name: str) -> str:
         if SIMULATE:
-            return STATUS.get("sim_state", "RUNNING")
+            return self._sim.get(name, "MISSING")
         c, o = run(["sc.exe", "query", self.service(name)], 30)
         m = re.search(r":\s*\d\s+(STOPPED|START_PENDING|STOP_PENDING|RUNNING)", o)
         return m.group(1) if m else "MISSING"
@@ -601,7 +613,7 @@ class WireGuard:
             f.write(text)
         _lock(p)
         if SIMULATE:
-            STATUS["sim_state"] = "RUNNING"
+            self._sim[name] = "RUNNING"
             log("[simuliert] Tunnel", name, "eingerichtet")
             return
         c, o = run([self.exe, "/installtunnelservice", p], 120)
@@ -611,7 +623,7 @@ class WireGuard:
 
     def remove_tunnel(self, name: str) -> None:
         if SIMULATE:
-            STATUS["sim_state"] = "MISSING"
+            self._sim.pop(name, None)
         elif self.svc_state(name) != "MISSING":
             run([self.exe, "/uninstalltunnelservice", name], 120)
             for _ in range(20):
@@ -625,34 +637,59 @@ class WireGuard:
 
     def start(self, name: str) -> None:
         if SIMULATE:
-            STATUS["sim_state"] = "RUNNING"
+            if name in self._sim:
+                self._sim[name] = "RUNNING"
             return
         run(["sc.exe", "start", self.service(name)], 60)
 
     def stop(self, name: str) -> None:
         if SIMULATE:
-            STATUS["sim_state"] = "STOPPED"
+            if name in self._sim:
+                self._sim[name] = "STOPPED"
             return
         run(["sc.exe", "stop", self.service(name)], 60)
 
-    def stats(self, name: str) -> dict:
-        """latest handshake (unix time) and transfer of the tunnel."""
+    def dump(self) -> dict:
+        """All running tunnels at once (`wg show all dump`): name -> {listen_port, peers, rx, tx, last_handshake, endpoint}."""
+        out: dict = {}
         if SIMULATE:
-            return {"last_handshake": int(time.time()) - 20, "rx": 1234, "tx": 567}
-        out = {}
-        c, o = run([self.wg, "show", name, "latest-handshakes"], 30)
-        if c == 0:
-            hs = [int(x.split()[-1]) for x in o.splitlines() if x.strip() and x.split()[-1].isdigit()]
-            out["last_handshake"] = max(hs) if hs else 0
-        c, o = run([self.wg, "show", name, "transfer"], 30)
-        if c == 0:
-            rx = tx = 0
+            import random
+            for n, s in self._sim.items():
+                if s != "RUNNING":
+                    continue
+                c = self._simc.setdefault(n, [0, 0])
+                c[0] += random.randint(2_000, 400_000)
+                c[1] += random.randint(500, 60_000)
+                out[n] = {"listen_port": "51820", "peers": [{"public_key": "SIM", "endpoint": "198.51.100.7:51820",
+                                                               "allowed_ips": "10.0.0.0/24", "last_handshake": int(time.time()) - 20,
+                                                               "rx": c[0], "tx": c[1]}]}
+        else:
+            if not os.path.exists(self.wg):
+                return {}
+            c, o = run([self.wg, "show", "all", "dump"], 30)
+            if c != 0:
+                return {}
             for line in o.splitlines():
-                p = line.split()
-                if len(p) >= 3 and p[-1].isdigit() and p[-2].isdigit():
-                    rx, tx = rx + int(p[-2]), tx + int(p[-1])
-            out.update(rx=rx, tx=tx)
+                p = line.split("\t")
+                if len(p) == 5:
+                    out[p[0]] = {"listen_port": p[3], "peers": []}
+                elif len(p) >= 9 and p[0] in out:
+                    try:
+                        out[p[0]]["peers"].append({"public_key": p[1], "endpoint": "" if p[3] == "(none)" else p[3],
+                                                   "allowed_ips": p[4], "last_handshake": int(p[5]), "rx": int(p[6]), "tx": int(p[7])})
+                    except ValueError:
+                        continue
+        for v in out.values():
+            ps = v["peers"]
+            v.update(rx=sum(x["rx"] for x in ps), tx=sum(x["tx"] for x in ps),
+                     last_handshake=max((x["last_handshake"] for x in ps), default=0),
+                     endpoint=next((x["endpoint"] for x in ps if x["endpoint"]), ""))
         return out
+
+    def stats(self, name: str) -> dict:
+        """latest handshake (unix time) and transfer of one tunnel."""
+        d = self.dump().get(name) or {}
+        return {k: d[k] for k in ("last_handshake", "rx", "tx") if k in d}
 
 
 # ------------------------------------------------------------------ the service loop
@@ -660,6 +697,23 @@ def boot_time() -> int:
     if WIN:
         return int(time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000) // 60 * 60
     return 0
+
+
+class CmdError(Exception):
+    pass
+
+
+CMD_DIR = "cmd"
+
+
+def _secure_cmd_dir() -> str:
+    """Folder for commands of the window/CLI: only SYSTEM and administrators may write (and read – may contain keys)."""
+    d = os.path.join(DATA, CMD_DIR)
+    os.makedirs(d, exist_ok=True)
+    if _real_install():
+        subprocess.run(["icacls.exe", d, "/inheritance:r", "/grant:r", f"{SID_SYSTEM}:(OI)(CI)F", f"{SID_ADMINS}:(OI)(CI)F", "/Q"],
+                       stdin=subprocess.DEVNULL, capture_output=True, creationflags=NOWIN)
+    return d
 
 
 class Agent:
@@ -671,12 +725,21 @@ class Agent:
         self.events: list[str] = []
         self.next_poll = self.next_wg = self.next_self = 0.0
         self.uma_wg = None
-        self.restart_pause, self.next_restart, self.tunnel_started = 60, 0.0, time.time()
-        if self.state.get("user_off") and self.state.get("user_off_boot") != boot_time():
-            self.state["user_off"] = False                     # a restart of Windows reconnects
-            log("Windows neu gestartet – Tunnel wird wieder verbunden")
+        self.rt: dict[str, dict] = {}                       # per tunnel: started, pause, next_restart
+        self._summaries: dict[str, tuple] = {}
+        self.state.setdefault("local", {})
         if self.state.get("user_off") is None:
             self.state["user_off"] = False
+        boot = boot_time()
+        if self.state.get("boot", self.state.get("user_off_boot")) != boot:
+            self.boot_policy()
+        self.state["boot"] = boot
+        self.keep()
+        try:
+            os.makedirs(os.path.join(DATA, "ui"), exist_ok=True)
+            _secure_cmd_dir()
+        except OSError as e:
+            log("Befehlsordner:", e)
 
     # ----- helpers
     @property
@@ -696,11 +759,112 @@ class Agent:
         except OSError:
             return ""
 
+    # ----- tunnels: the one from VERA + own ones (imported, QR, created by hand, restored)
+    @property
+    def local(self) -> dict:
+        return self.state["local"]
+
+    def vera_name(self) -> str | None:
+        return self.state.get("tunnel")
+
+    def names(self) -> list[str]:
+        return ([self.vera_name()] if self.vera_name() else []) + sorted(self.local, key=str.lower)
+
+    def find(self, name: str) -> str | None:
+        return next((n for n in self.names() if n.lower() == (name or "").lower()), None)
+
+    def default_name(self) -> str | None:
+        d = self.state.get("default")
+        if d and d in self.names():
+            return d
+        return self.vera_name() or (self.names() or [None])[0]
+
+    def is_on(self, name: str) -> bool:
+        if name == self.vera_name():
+            return not self.state.get("user_off")
+        return bool(self.local.get(name, {}).get("on"))
+
+    def config_of(self, name: str) -> str:
+        if name == self.vera_name():
+            return self.cached_config()
+        t = self.local.get(name)
+        try:
+            return unprotect(t["config"]).decode() if t and t.get("config") else ""
+        except OSError:
+            return ""
+
+    def summary(self, name: str) -> dict:
+        text = self.config_of(name)
+        h = hashlib.sha256(text.encode()).hexdigest()
+        if self._summaries.get(name, ("",))[0] != h:
+            try:
+                s = wgconf.summary(text) if text else {}
+            except wgconf.ConfError:
+                s = {}
+            self._summaries[name] = (h, s)
+        return self._summaries[name][1]
+
+    def boot_policy(self) -> None:
+        """After a restart of Windows only the default tunnel connects (the VERA tunnel also if VERA forbids disconnecting)."""
+        d = self.default_name()
+        for n, t in self.local.items():
+            t["on"] = n == d
+        if self.vera_name():
+            self.state["user_off"] = not (d == self.vera_name() or not self.state.get("allow_disconnect", True))
+        if self.names():
+            log(f"Windows neu gestartet – verbunden wird der Standard-Tunnel {d}")
+
+    def allow_disconnect(self) -> bool:
+        return bool(STATUS.get("allow_disconnect", self.state.get("allow_disconnect", True)))
+
+    def set_on(self, name: str, on: bool, who: str = "Benutzer") -> None:
+        name = self.find(name) or name
+        if name not in self.names():
+            raise CmdError(f"Tunnel „{name}“ gibt es nicht")
+        if self.is_on(name) == on:
+            return
+        vt = self.vera_name()
+        if not on and name == vt and not self.allow_disconnect():
+            raise CmdError("Den Tunnel von VERA zu trennen ist in VERA nicht erlaubt")
+        if on and self.summary(name).get("full_tunnel"):            # only one tunnel may take all traffic
+            for other in self.names():
+                if other != name and self.is_on(other) and self.summary(other).get("full_tunnel"):
+                    if other == vt and not self.allow_disconnect():
+                        raise CmdError(f"„{other}“ leitet schon den ganzen Verkehr um und darf nicht getrennt werden")
+                    self.set_on(other, False, who)
+                    self.event(f"Tunnel {other} getrennt – {name} leitet den ganzen Verkehr um")
+        if name == vt:
+            self.state["user_off"] = not on
+        else:
+            self.local[name]["on"] = on
+        self.keep()
+        self.rt.pop(name, None)
+        if not on and self.wg.svc_state(name) != "MISSING":
+            self.wg.remove_tunnel(name)
+        self.event(f"Tunnel {name} {'verbunden' if on else 'getrennt'} ({who})")
+
+    def rows(self, dump: dict) -> list[dict]:
+        d = self.default_name()
+        out = []
+        for n in self.names():
+            s = self.summary(n)
+            live = dump.get(n) or {}
+            peers = s.get("peers") or [{}]
+            out.append({"name": n, "source": "vera" if n == self.vera_name() else "local", "on": self.is_on(n), "default": n == d,
+                        "state": self.rt.get(n, {}).get("state", "off"), "address": ", ".join(s.get("address", [])),
+                        "dns": ", ".join(s.get("dns", [])), "endpoint": live.get("endpoint") or peers[0].get("endpoint", ""),
+                        "allowed_ips": ", ".join(a for p in s.get("peers", []) for a in p["allowed_ips"]),
+                        "public_key": s.get("public_key", ""), "full_tunnel": bool(s.get("full_tunnel")),
+                        "last_handshake": live.get("last_handshake", 0), "origin": self.local.get(n, {}).get("origin", "VERA")})
+        return out
+
     def report(self) -> dict:
         f = self.dev.refresh_facts()
-        t = self.state.get("tunnel")
         st = {"version": VERSION, "wg_version": self.wg.version(), "wg_source": STATUS.get("wg_source", ""), "hostname": f.get("hostname"), "user": f.get("user") or "",
-              "os": f.get("os"), "user_off": bool(self.state.get("user_off")), "tunnel_state": STATUS.get("tunnel_state", "waiting")}
+              "os": f.get("os"), "user_off": bool(self.state.get("user_off")), "tunnel_state": STATUS.get("tunnel_state", "waiting"),
+              "tunnels": [{"name": r["name"], "source": r["source"], "on": r["on"], "state": r["state"], "default": r["default"]}
+                          for r in STATUS.get("tunnels", [])][:20]}
+        t = self.vera_name()
         if t and STATUS.get("tunnel_state") == "up":
             st.update(self.wg.stats(t))
         if STATUS.get("last_error"):
@@ -739,15 +903,21 @@ class Agent:
                             {"config_hash": self.state.get("config_hash", ""), "report": self.report(), "events": self.events})
             self.events = []
             STATUS.pop("last_error", None)
-            set_status(server_ok=time.time(), allow_disconnect=bool(r.get("allow_disconnect", True)), vera=c["url"])
+            allow = bool(r.get("allow_disconnect", True))
+            if self.state.get("allow_disconnect", True) != allow:
+                self.state["allow_disconnect"] = allow
+                self.keep()
+            set_status(server_ok=time.time(), allow_disconnect=allow, vera=c["url"], backup=bool(r.get("backup")))
             self.next_poll = time.time() + (POLL_MIN if os.environ.get("VC_FAST") else max(POLL_MIN, int(r.get("interval") or 60)))
             st = r.get("status")
             if st == "pending":
                 set_status(state="pending", message="wartet auf Freigabe in VERA")
             elif st == "blocked":
-                if self.state.get("tunnel"):
-                    self.wg.remove_tunnel(self.state["tunnel"])
+                if self.vera_name():
+                    self.wg.remove_tunnel(self.vera_name())
                     self.event("In VERA gesperrt – Tunnel entfernt")
+                    if self.state.get("default") == self.vera_name():
+                        self.state["default"] = None
                 self.state.update(tunnel=None, config=None, config_hash="")
                 self.keep()
                 set_status(state="blocked", message="in VERA gesperrt", tunnel_state="missing")
@@ -772,19 +942,27 @@ class Agent:
 
     def fetch_and_apply(self) -> None:
         r = request(self.dev, self.conf["url"], "POST", "/client/config", {})
-        name = re.sub(r"[^A-Za-z0-9_=+.-]", "", self.conf.get("tunnel") or r.get("tunnel") or "VERA")[:32] or "VERA"
+        name = wgconf.safe_name(self.conf.get("tunnel") or r.get("tunnel") or "VERA", "VERA")
+        if any(n.lower() == name.lower() for n in self.local):        # name taken by an own tunnel
+            name = (name[:27] + "-VERA")
         text = r["text"]
         self.ensure_wireguard()
-        old = self.state.get("tunnel")
+        old = self.vera_name()
         if old and old != name:
             self.wg.remove_tunnel(old)
-        self.wg.install_tunnel(name, text)
+            if self.state.get("default") == old:
+                self.state["default"] = name
+        if not self.vera_name() and not self.state.get("default"):
+            self.state["default"] = name
         self.state.update(tunnel=name, config=protect(text.encode()), config_hash=r["hash"])
         self.keep()
-        self.tunnel_started, self.restart_pause = time.time(), 60
-        if self.state.get("user_off"):
-            self.wg.stop(name)
-        self.event(f"Neue Konfiguration eingerichtet (Tunnel {name})")
+        self.rt.pop(name, None)
+        if self.is_on(name):
+            self.wg.install_tunnel(name, text)
+            self.rt[name] = {"started": time.time(), "pause": 60, "next": 0, "state": "connecting"}
+        elif self.wg.svc_state(name) != "MISSING":
+            self.wg.remove_tunnel(name)
+        self.event(f"Neue Konfiguration von VERA eingerichtet (Tunnel {name})")
         set_status(state="ready", message="", tunnel=name)
 
     # ----- UMA: own updates + components (WireGuard)
@@ -829,6 +1007,12 @@ class Agent:
             raise RuntimeError(f"{program} {item['version']} von UMA hat eine ungültige Signatur – wird nicht installiert")
         return blob
 
+    def restart_running(self) -> None:
+        """After a WireGuard update: start the tunnels that should run."""
+        for n in self.names():
+            if self.is_on(n) and self.wg.svc_state(n) not in ("RUNNING", "MISSING"):
+                self.wg.start(n)
+
     def wireguard_from_uma(self) -> bool:
         """Install/update WireGuard from UMA if UMA offers it. True = UMA is responsible for WireGuard."""
         wg = self.uma_wg
@@ -852,9 +1036,8 @@ class Agent:
             except OSError:
                 pass
         self.event(f"WireGuard {wg['version']} aus UMA installiert" + (f" (vorher {have})" if have else ""))
-        t = self.state.get("tunnel")
-        if t and have and not self.state.get("user_off") and self.wg.svc_state(t) != "RUNNING":
-            self.wg.start(t)
+        if have:
+            self.restart_running()
         set_status(message="")
         return True
 
@@ -885,9 +1068,7 @@ class Agent:
                 set_status(message=f"WireGuard {v} wird installiert …")
                 self.wg.install(v, url)
                 self.event(f"WireGuard aktualisiert: {have} → {v} (Hersteller)")
-                t = self.state.get("tunnel")
-                if t and not self.state.get("user_off") and self.wg.svc_state(t) != "RUNNING":
-                    self.wg.start(t)
+                self.restart_running()
                 set_status(message="")
         except Exception as e:  # noqa: BLE001
             log("WireGuard-Update:", e)
@@ -927,80 +1108,365 @@ class Agent:
             set_status(update_state=f"Fehler: {e}")
             self.next_self = time.time() + 3600
 
-    # ----- watchdog
+    # ----- flags of the tray / window (any user)
+    def flags(self) -> None:
+        d = os.path.join(DATA, "ui")
+        try:
+            files = os.listdir(d)
+        except OSError:
+            return
+        for f in files:
+            if not f.endswith(".flag") or f in ("live.flag", "refresh.flag"):
+                continue
+            if not take_flag(f):
+                continue
+            try:
+                if f == "disconnect.flag":                         # tray "Trennen": everything the user may switch off
+                    for n in self.names():
+                        if self.is_on(n):
+                            try:
+                                self.set_on(n, False)
+                            except CmdError as e:
+                                self.event(str(e))
+                elif f == "connect.flag":
+                    if self.default_name():
+                        self.set_on(self.default_name(), True)
+                elif f.startswith(("connect@", "disconnect@")):
+                    on = f.startswith("connect@")
+                    self.set_on(f.split("@", 1)[1][:-5], on)
+            except CmdError as e:
+                self.event(str(e))
+                set_status(message=str(e))
+
+    def pending_flags(self) -> bool:
+        try:
+            return any(f.endswith(".flag") and f != "live.flag" for f in os.listdir(os.path.join(DATA, "ui")))
+        except OSError:
+            return False
+
+    # ----- watchdog (every tunnel that should run)
     def watch(self) -> None:
-        t = self.state.get("tunnel")
-        if not t:
-            set_status(tunnel_state="waiting")
+        self.flags()
+        names = self.names()
+        if not names:
+            set_status(tunnel_state="waiting", tunnels=[])
             return
-        if take_flag("disconnect.flag") and STATUS.get("allow_disconnect", True):
-            self.state.update(user_off=True, user_off_boot=boot_time())
-            self.keep()
-            self.wg.stop(t)
-            self.event("Vom Benutzer getrennt")
-        if take_flag("connect.flag") and self.state.get("user_off"):
-            self.state["user_off"] = False
-            self.keep()
-            self.wg.start(t)
-            self.tunnel_started, self.restart_pause = time.time(), 60
-            self.event("Vom Benutzer verbunden")
-        s = self.wg.svc_state(t)
-        if s == "MISSING":                                        # deleted by someone / config lost
-            text = self.cached_config()
-            if text:
-                try:
-                    self.ensure_wireguard()
-                    self.wg.install_tunnel(t, text)
-                    self.tunnel_started = time.time()
-                    self.event("Tunnel fehlte – aus gespeicherter Konfiguration wiederhergestellt")
-                    if self.state.get("user_off"):
-                        self.wg.stop(t)
-                except Exception as e:  # noqa: BLE001
-                    set_status(tunnel_state="missing", last_error=str(e)[:300])
-                    log("Wiederherstellen:", e)
-                    return
-            else:
-                self.state["config_hash"] = ""                    # fetch again at the next poll
-                self.next_poll = 0
-                set_status(tunnel_state="missing")
+        dump = self.wg.dump() if any(self.is_on(n) for n in names) else {}
+        for n in names:
+            try:
+                self.watch_one(n, dump)
+            except Exception as e:  # noqa: BLE001
+                self.rt.setdefault(n, {})["state"] = "missing"
+                set_status(last_error=str(e)[:300])
+                log(f"Tunnel {n}:", e)
+        rows = self.rows(dump)
+        on = [r for r in rows if r["on"]]
+        vt = next((r for r in rows if r["source"] == "vera"), None)
+        if not on:
+            state = "user_off"
+        elif any(r["state"] in ("down", "missing") for r in on):
+            state = "down"
+        elif any(r["state"] == "connecting" for r in on):
+            state = "ready"
+        else:
+            state = "up"
+        prim = next((r for r in on if r["default"]), on[0] if on else None)
+        extra = {"state": state, **({"message": ""} if state == "up" else {})}
+        tstate = ("user_off" if not vt["on"] else vt["state"]) if vt else "waiting"
+        set_status(tunnel_state={"idle": "up", "connecting": "down", "off": "user_off"}.get(tstate, tstate), tunnels=rows,
+                   tunnel=prim["name"] if prim else self.default_name(), default=self.default_name(),
+                   last_handshake=(prim or {}).get("last_handshake", 0), **extra)
+
+    def watch_one(self, n: str, dump: dict) -> None:
+        r = self.rt.setdefault(n, {"started": time.time(), "pause": 60, "next": 0, "state": "off"})
+        s = self.wg.svc_state(n)
+        if not self.is_on(n):
+            if s != "MISSING":
+                self.wg.remove_tunnel(n)
+            r["state"] = "off"
+            return
+        if s == "MISSING":
+            text = self.config_of(n)
+            if not text:
+                if n == self.vera_name():
+                    self.state["config_hash"] = ""                  # fetch again at the next poll
+                    self.next_poll = 0
+                r["state"] = "missing"
                 return
-        if self.state.get("user_off"):
-            if s == "RUNNING":
-                self.wg.stop(t)
-            set_status(tunnel_state="user_off", state="user_off")
+            self.ensure_wireguard()
+            self.wg.install_tunnel(n, text)
+            r.update(started=time.time(), state="connecting")
+            if r.get("seen"):
+                self.event(f"Tunnel {n} fehlte – aus gespeicherter Konfiguration wiederhergestellt")
+            r["seen"] = True
             return
+        r["seen"] = True
         if s != "RUNNING":
-            if time.time() >= self.next_restart:
-                self.wg.start(t)
-                self.tunnel_started = time.time()
-                self.event("Tunnel war aus – neu gestartet")
-                self.next_restart = time.time() + 30
-            set_status(tunnel_state="down", state="down")
+            if time.time() >= r.get("next", 0):
+                self.wg.start(n)
+                r["started"] = time.time()
+                self.event(f"Tunnel {n} war aus – neu gestartet")
+                r["next"] = time.time() + 30
+            r["state"] = "down"
             return
-        hs = self.wg.stats(t).get("last_handshake") or 0
+        hs = (dump.get(n) or {}).get("last_handshake") or 0
         age = time.time() - hs if hs else None
         if age is not None and age <= HANDSHAKE_MAX:
-            self.restart_pause = 60
-            set_status(tunnel_state="up", state="up", last_handshake=hs, message="")
+            r.update(state="up", pause=60)
             return
-        set_status(tunnel_state="down", state="down", last_handshake=hs)
-        if time.time() - self.tunnel_started < HANDSHAKE_MAX or time.time() < self.next_restart:
+        watched = n == self.vera_name() or self.summary(n).get("keepalive")
+        if not watched:                                             # no keepalive: a handshake only comes with traffic
+            r["state"] = "idle"
+            return
+        r["state"] = "down" if time.time() - r["started"] >= HANDSHAKE_MAX else "connecting"
+        if time.time() - r["started"] < HANDSHAKE_MAX or time.time() < r.get("next", 0):
             return
         if not internet_ok():
             set_status(message="kein Internet – warte")
             return
-        log(f"Kein Handshake seit {int(age) if age else 'Start'} s – Tunnel wird neu verbunden (nächster Versuch frühestens in {self.restart_pause // 60} min)")
-        self.wg.stop(t)
+        log(f"Tunnel {n}: kein Handshake seit {int(age) if age else 'Start'} s – wird neu verbunden (nächster Versuch frühestens in {r['pause'] // 60} min)")
+        self.wg.stop(n)
         time.sleep(2)
-        self.wg.start(t)
-        self.tunnel_started = time.time()
-        self.next_restart = time.time() + self.restart_pause
-        self.restart_pause = min(self.restart_pause * 2, 1800)
-        self.events.append("Tunnel ohne Verbindung – neu verbunden")
+        self.wg.start(n)
+        r["started"] = time.time()
+        r["next"] = time.time() + r["pause"]
+        r["pause"] = min(r["pause"] * 2, 1800)
+        self.events.append(f"Tunnel {n} ohne Verbindung – neu verbunden")
+
+    # ----- live data for the window (only while it is open: it touches ui\live.flag)
+    def live(self) -> None:
+        try:
+            if time.time() - os.path.getmtime(os.path.join(DATA, "ui", "live.flag")) > 15:
+                return
+        except OSError:
+            return
+        dump = self.wg.dump()
+        data = {"t": time.time(), "tunnels": {n: {k: v for k, v in (dump.get(n) or {}).items() if k != "peers"} | {"running": n in dump}
+                                              for n in self.names()}}
+        try:
+            tmp = _path("live.json.new")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, _path("live.json"))
+        except OSError:
+            pass
+
+    # ----- commands of the window / CLI (cmd\ is writable for administrators only)
+    def commands(self) -> bool:
+        d = os.path.join(DATA, CMD_DIR)
+        try:
+            files = sorted(f for f in os.listdir(d) if f.endswith(".req.json"))
+        except OSError:
+            return False
+        for f in files:
+            p = os.path.join(d, f)
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    req = json.load(fh)
+            except (OSError, ValueError):
+                req = None
+            try:
+                os.remove(p)                                        # may contain keys – away at once
+            except OSError:
+                pass
+            if not isinstance(req, dict):
+                continue
+            rid = re.sub(r"[^A-Za-z0-9]", "", str(req.get("id") or f[:-9]))[:32] or secrets.token_hex(6)
+            try:
+                res = {"ok": True, "data": self.command(req) or {}}
+            except (CmdError, wgconf.ConfError) as e:
+                res = {"ok": False, "message": str(e)}
+            except HttpError as e:
+                res = {"ok": False, "message": e.detail if e.status != 404 or "unbekannt" in e.detail
+                       else "VERA kennt keine Sicherungen – VERA 1.3 oder neuer nötig"}
+            except (OSError, ValueError) as e:
+                res = {"ok": False, "message": f"VERA nicht erreichbar: {explain(e)}"}
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                log("Befehl", req.get("action"), "fehlgeschlagen:", traceback.format_exc()[-600:])
+                res = {"ok": False, "message": f"Fehler: {e}"}
+            log(f"Befehl {req.get('action')}: {'ok' if res['ok'] else res['message']}")
+            try:
+                tmp = os.path.join(d, rid + ".res.new")
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(res, fh, ensure_ascii=False)
+                os.replace(tmp, os.path.join(d, rid + ".res.json"))
+            except OSError as e:
+                log("Antwort nicht schreibbar:", e)
+        for f in os.listdir(d) if files else []:                     # old answers nobody picked up
+            p = os.path.join(d, f)
+            try:
+                if f.endswith(".res.json") and time.time() - os.path.getmtime(p) > 600:
+                    os.remove(p)
+            except OSError:
+                pass
+        return bool(files)
+
+    def _check_new_name(self, name: str, allow: str | None = None) -> str:
+        name = (name or "").strip()
+        if not wgconf.valid_name(name):
+            raise CmdError("Name: 1–32 Zeichen, nur Buchstaben, Ziffern und - _ . = + (keine Leerzeichen)")
+        other = self.find(name)
+        if other and other != allow:
+            raise CmdError(f"Ein Tunnel „{other}“ gibt es schon")
+        return name
+
+    def command(self, req: dict) -> dict | None:
+        a = req.get("action")
+        if a in ("create", "edit"):
+            text = str(req.get("text") or "")
+            wgconf.parse(text)
+            if a == "create":
+                name = self._check_new_name(req.get("name"))
+                self.local[name] = {"config": protect(text.encode()), "on": False, "created": time.time(),
+                                    "origin": str(req.get("origin") or "von Hand")[:40]}
+                self.keep()
+                self.event(f"Tunnel {name} angelegt ({self.local[name]['origin']})")
+                if req.get("connect"):
+                    self.set_on(name, True, "Fenster")
+                return {"name": name}
+            name = self.find(req.get("name"))
+            if name not in self.local:
+                raise CmdError("Nur eigene Tunnel lassen sich bearbeiten – der Tunnel von VERA kommt aus VERA")
+            self.local[name]["config"] = protect(text.encode())
+            self.keep()
+            if self.is_on(name):
+                self.wg.remove_tunnel(name)                         # the watchdog installs the new version
+            self.rt.pop(name, None)
+            self.event(f"Tunnel {name} geändert")
+            return {"name": name}
+        if a == "get":
+            name = self.find(req.get("name"))
+            if name not in self.local:
+                raise CmdError("Die Konfiguration des VERA-Tunnels verwaltet VERA")
+            return {"name": name, "text": self.config_of(name)}
+        if a == "rename":
+            old = self.find(req.get("name"))
+            if not old:
+                raise CmdError("Tunnel unbekannt")
+            new = self._check_new_name(req.get("new"), allow=old)
+            if new == old:
+                return {"name": new}
+            was_on = self.is_on(old)
+            if self.wg.svc_state(old) != "MISSING":
+                self.wg.remove_tunnel(old)
+            if old == self.vera_name():
+                c = self.conf
+                c["tunnel"] = new
+                save("config.json", c)
+                self.state["tunnel"] = new
+            else:
+                self.local[new] = self.local.pop(old)
+            if self.state.get("default") == old:
+                self.state["default"] = new
+            self.rt.pop(old, None)
+            self.keep()
+            self.event(f"Tunnel {old} heißt jetzt {new}" + (" – wird neu verbunden" if was_on else ""))
+            return {"name": new}
+        if a == "delete":
+            name = self.find(req.get("name"))
+            if name not in self.local:
+                raise CmdError("Der Tunnel von VERA lässt sich hier nicht löschen (in VERA sperren oder entfernen)")
+            self.wg.remove_tunnel(name)
+            del self.local[name]
+            if self.state.get("default") == name:
+                self.state["default"] = None
+            self.rt.pop(name, None)
+            self.keep()
+            self.event(f"Tunnel {name} gelöscht")
+            return {}
+        if a == "default":
+            name = self.find(req.get("name"))
+            if not name:
+                raise CmdError("Tunnel unbekannt")
+            self.state["default"] = name
+            self.keep()
+            self.event(f"Standard-Tunnel: {name}")
+            return {"name": name}
+        if a in ("connect", "disconnect"):
+            self.set_on(req.get("name"), a == "connect", "Fenster")
+            return {}
+        if a == "backup_create":
+            return self.backup_create(str(req.get("passphrase") or ""), str(req.get("comment") or "")[:200])
+        if a == "backup_list":
+            return self.vera_call("/client/backup/list", {})
+        if a == "backup_delete":
+            return self.vera_call("/client/backup/delete", {"id": int(req.get("backup_id") or 0)})
+        if a == "backup_restore":
+            return self.backup_restore(int(req.get("backup_id") or 0), str(req.get("passphrase") or ""), bool(req.get("settings")))
+        raise CmdError(f"Unbekannter Befehl {a}")
+
+    # ----- backup in VERA (tunnels + settings; sealed with a passphrase VERA never sees)
+    def vera_call(self, path: str, data: dict) -> dict:
+        url = self.conf.get("url")
+        if not url:
+            raise CmdError("Adresse von VERA fehlt")
+        return request(self.dev, url, "POST", path, data, timeout=60)
+
+    def backup_create(self, passphrase: str, comment: str) -> dict:
+        c = self.conf
+        tunnels = [{"name": n, "config": self.config_of(n), "on": self.is_on(n), "origin": t.get("origin", ""),
+                    "created": t.get("created")} for n, t in sorted(self.local.items())]
+        payload = {"format": "vera-connect-backup", "version": 1, "client_version": VERSION, "created": time.time(),
+                   "hostname": self.dev.facts.get("hostname", ""), "default": self.default_name(), "vera_tunnel": self.vera_name(),
+                   "settings": {k: c.get(k, "") for k in ("url", "update_url", "update_key", "tunnel")}, "tunnels": tunnels}
+        blob = wgconf.seal(payload, passphrase)
+        meta = {"tunnels": [t["name"] for t in tunnels], "vera_tunnel": self.vera_name() or "", "default": self.default_name() or "",
+                "client_version": VERSION, "hostname": payload["hostname"], "comment": comment}
+        r = self.vera_call("/client/backup/upload", {"meta": meta, "blob": blob})
+        self.event(f"Sicherung in VERA angelegt ({len(tunnels)} eigene Tunnel)")
+        return r
+
+    def backup_restore(self, bid: int, passphrase: str, settings: bool) -> dict:
+        r = self.vera_call("/client/backup/get", {"id": bid})
+        data = wgconf.unseal(r["blob"], passphrase)
+        if data.get("format") != "vera-connect-backup":
+            raise CmdError("Das ist keine Sicherung von VERA-Connect")
+        new = {}
+        for t in data.get("tunnels") or []:
+            text = t.get("config") or ""
+            wgconf.parse(text)
+            name = wgconf.safe_name(t.get("name") or "Tunnel")
+            if self.vera_name() and name.lower() == self.vera_name().lower():
+                name = name[:28] + "-alt"
+            new[name] = {"config": protect(text.encode()), "on": bool(t.get("on")), "created": t.get("created") or time.time(),
+                         "origin": (t.get("origin") or "Sicherung")[:40]}
+        for n in list(self.local):                                  # replace the own tunnels completely
+            if n not in new or self.config_of(n) != unprotect(new[n]["config"]).decode():
+                self.wg.remove_tunnel(n)
+                self.rt.pop(n, None)
+        self.state["local"] = new
+        d = data.get("default")
+        if d == data.get("vera_tunnel") and self.vera_name():
+            d = self.vera_name()
+        self.state["default"] = d if d in self.names() else None
+        applied = ["Tunnel"]
+        if settings:
+            c, s = self.conf, data.get("settings") or {}
+            changed_url = s.get("url") and s["url"] != c.get("url")
+            for k in ("url", "update_url", "update_key", "tunnel"):
+                if s.get(k) is not None:
+                    c[k] = s[k]
+            save("config.json", c)
+            if changed_url:
+                self.state.pop("enrolled", None)
+                self.next_poll = 0
+            applied.append("Einstellungen")
+        self.keep()
+        self.event(f"Sicherung vom {time.strftime('%d.%m.%Y %H:%M', time.localtime(data.get('created') or 0))} "
+                   f"wiederhergestellt: {len(new)} eigene Tunnel" + (" + Einstellungen" if settings else ""))
+        return {"tunnels": sorted(new), "applied": applied}
 
     def loop(self) -> None:
         log(f"{APP} {VERSION} startet (Daten: {DATA}{', SIMULATION' if SIMULATE else ''})")
-        set_status(state="start", message="", tunnel=self.state.get("tunnel"), vera=self.conf.get("url", ""),
+        if COMPILED:                                                # leftovers of a self-update (renamed running EXE)
+            import glob
+            for f in glob.glob(os.path.join(home_dir(), "vera-connect.exe.old-*")):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+        set_status(state="start", message="", tunnel=self.default_name(), vera=self.conf.get("url", ""),
                    uma=self.conf.get("update_url", ""))
         while not STOP.is_set():
             try:
@@ -1011,7 +1477,7 @@ class Agent:
                 if time.time() >= self.next_poll:
                     self.poll()
                 self.watch()
-                if time.time() >= self.next_wg and self.state.get("tunnel"):
+                if time.time() >= self.next_wg and self.names():
                     self.wireguard_update()
                 if time.time() >= self.next_self:
                     self.self_update()
@@ -1021,8 +1487,12 @@ class Agent:
                 set_status(last_error=str(e)[:300])
             end = time.time() + WATCH_EVERY
             while not STOP.is_set() and time.time() < end:
-                if any(os.path.exists(os.path.join(DATA, "ui", f)) for f in ("connect.flag", "disconnect.flag", "refresh.flag")):
-                    break
+                try:
+                    if self.pending_flags() or self.commands():
+                        break
+                    self.live()
+                except Exception as e:  # noqa: BLE001
+                    log("Fehler:", e)
                 STOP.wait(1)
         log(f"{APP} beendet")
 
@@ -1300,8 +1770,8 @@ def uninstall(silent: bool) -> None:
     import winservice
     if not ctypes.windll.shell32.IsUserAnAdmin():
         raise SystemExit("Bitte als Administrator ausführen.")
-    if not silent and ctypes.windll.user32.MessageBoxW(None, "VERA-Connect entfernen? Der WireGuard-Tunnel dieses Rechners wird dabei ebenfalls entfernt. "
-                                                       "WireGuard selbst bleibt installiert.", APP, 0x34) != 6:
+    if not silent and ctypes.windll.user32.MessageBoxW(None, "VERA-Connect entfernen? Die WireGuard-Tunnel dieses Rechners werden dabei ebenfalls entfernt "
+                                                       "(eigene Tunnel bleiben für eine Neuinstallation gespeichert). WireGuard selbst bleibt installiert.", APP, 0x34) != 6:
         return
     tray_autostart(False)
     try:
@@ -1312,9 +1782,12 @@ def uninstall(silent: bool) -> None:
     if winservice._query_state() is not None:
         winservice.remove()
     st = load("state.json")
-    if st.get("tunnel"):
-        WireGuard().remove_tunnel(st["tunnel"])
-    for f in ("state.json", "status.json"):
+    wg = WireGuard()
+    for n in ([st["tunnel"]] if st.get("tunnel") else []) + list(st.get("local") or {}):
+        wg.remove_tunnel(n)
+    if st.get("local"):                                             # own tunnels stay (DPAPI) for a reinstall – switched off
+        save("state.json", {"local": {n: {**t, "on": False} for n, t in st["local"].items()}, "default": st.get("default")})
+    for f in (("state.json",) if not st.get("local") else ()) + ("status.json", "live.json"):
         try:
             os.remove(_path(f))
         except OSError:
@@ -1334,12 +1807,21 @@ def upgrade(target: str) -> None:
     log(f"Selbst-Update auf {VERSION}: ersetze {target}")
     winservice.stop()
     me = os.path.abspath(sys.argv[0])
-    for _ in range(30):
+    for i in range(30):
         try:
             shutil.copy2(me, target)
             break
         except OSError:
-            time.sleep(1)
+            # still running (tray/window of a logged-on user): a running EXE cannot be overwritten, but renamed –
+            # it keeps running from the old file, the next start uses the new one
+            try:
+                old = f"{target}.old-{int(time.time())}"
+                os.replace(target, old)
+                shutil.copy2(me, target)
+                log("Selbst-Update: laufende EXE umbenannt nach", os.path.basename(old))
+                break
+            except OSError:
+                time.sleep(1)
     else:
         log("Selbst-Update: Datei blieb gesperrt – alte Version läuft weiter")
     _reg(UNINSTALL_KEY, {"DisplayVersion": VERSION})
@@ -1408,6 +1890,102 @@ def setup(argv: list[str]) -> None:
                "Die Adresse von VERA fehlt noch – Rechtsklick auf das Symbol in der Taskleiste › Einstellungen."))
 
 
+def send_command(req: dict, timeout: int = 180) -> dict:
+    """Hand a command to the service (folder cmd, administrators only) and wait for its answer."""
+    d = os.path.join(DATA, CMD_DIR)
+    os.makedirs(d, exist_ok=True)
+    rid = req.setdefault("id", secrets.token_hex(8))
+    tmp = os.path.join(d, rid + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(req, f, ensure_ascii=False)
+    os.replace(tmp, os.path.join(d, rid + ".req.json"))
+    res = os.path.join(d, rid + ".res.json")
+    end = time.time() + timeout
+    while time.time() < end:
+        if os.path.exists(res):
+            time.sleep(0.05)
+            try:
+                with open(res, encoding="utf-8") as f:
+                    r = json.load(f)
+                os.remove(res)
+                return r
+            except (OSError, ValueError):
+                pass
+        time.sleep(0.25)
+    try:
+        os.remove(os.path.join(d, rid + ".req.json"))
+    except OSError:
+        pass
+    return {"ok": False, "message": "Der Dienst VeraConnect antwortet nicht – läuft er?"}
+
+
+def admin_cmd(path: str) -> None:
+    """Started elevated by the window of a normal user: pass the request on, write the answer next to it."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            req = json.load(f)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    try:
+        r = send_command(req)
+    except OSError as e:
+        r = {"ok": False, "message": f"Befehl nicht übergeben: {e}"}
+    tmp = path + ".res.new"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(r, f, ensure_ascii=False)
+    os.replace(tmp, path + ".res")
+
+
+def _cli_result(r: dict) -> None:
+    if not r.get("ok"):
+        raise SystemExit("Fehler: " + str(r.get("message")))
+    print(json.dumps(r.get("data") or {}, indent=2, ensure_ascii=False))
+
+
+def cli_tunnel(a) -> None:
+    if a.action == "list":
+        st = load("status.json")
+        for t in st.get("tunnels") or []:
+            print(f"{'*' if t['default'] else ' '} {t['name']:<32} {'VERA ' if t['source'] == 'vera' else 'eigen'} "
+                  f"{'an ' if t['on'] else 'aus'} {t['state']:<10} {t.get('endpoint', '')}")
+        return
+    req = {"action": a.action, "name": a.name}
+    if a.action in ("import", "import-qr"):
+        if a.action == "import":
+            text = open(a.name, encoding="utf-8-sig").read()
+            origin = "Datei " + os.path.basename(a.name)
+        else:
+            import qrdecode
+            text = qrdecode.decode_file(a.name)
+            origin = "QR-Code " + os.path.basename(a.name)
+        wgconf.parse(text)
+        req = {"action": "create", "name": a.new or wgconf.safe_name(os.path.splitext(os.path.basename(a.name))[0]), "text": text,
+               "origin": origin, "connect": a.connect}
+    elif a.action == "rename":
+        req["new"] = a.new
+    _cli_result(send_command(req))
+
+
+def cli_backup(a) -> None:
+    req: dict = {"action": "backup_" + a.action}
+    if a.action in ("create", "restore"):
+        pw = os.environ.get("VC_BACKUP_PASSPHRASE")
+        if not pw:
+            import getpass
+            pw = getpass.getpass("Kennwort der Sicherung: ")
+        req["passphrase"] = pw
+    if a.action == "create":
+        req["comment"] = a.comment
+    if a.action in ("restore", "delete"):
+        req["backup_id"] = a.id
+    if a.action == "restore":
+        req["settings"] = a.settings
+    _cli_result(send_command(req))
+
+
 def main() -> None:
     global DATA, SIMULATE
     argv = sys.argv[1:]
@@ -1438,6 +2016,26 @@ def main() -> None:
     t = sub.add_parser("tray")
     t.add_argument("--data", default="")
     t.add_argument("--selbsttest", type=float, default=0, help=argparse.SUPPRESS)
+    gu = sub.add_parser("gui", help="Fenster: Tunnel, Live-Anzeige, Import, Sicherung")
+    gu.add_argument("--data", default="")
+    gu.add_argument("--selbsttest", type=float, default=0, help=argparse.SUPPRESS)
+    tu = sub.add_parser("tunnel", help="Tunnel verwalten (Administrator)")
+    tu.add_argument("action", choices=["list", "import", "import-qr", "connect", "disconnect", "default", "rename", "delete"])
+    tu.add_argument("name", nargs="?", default="", help="Tunnel bzw. Datei/Bild beim Import")
+    tu.add_argument("new", nargs="?", default="", help="neuer Name (rename) bzw. Name beim Import")
+    tu.add_argument("--connect", action="store_true", help="nach dem Import verbinden")
+    tu.add_argument("--data", default="")
+    bk = sub.add_parser("backup", help="Sicherung in VERA (Administrator; Kennwort aus VC_BACKUP_PASSPHRASE oder Abfrage)")
+    bk.add_argument("action", choices=["create", "list", "restore", "delete"])
+    bk.add_argument("id", nargs="?", type=int, default=0)
+    bk.add_argument("--comment", default="")
+    bk.add_argument("--settings", action="store_true", help="beim Wiederherstellen auch die Adressen übernehmen")
+    bk.add_argument("--data", default="")
+    qd = sub.add_parser("qr-decode", help="QR-Code in einem Bild lesen und Text ausgeben")
+    qd.add_argument("image")
+    ac = sub.add_parser("admin-cmd", help=argparse.SUPPRESS)
+    ac.add_argument("request")
+    ac.add_argument("--data", default="")
     if argv[0] == "uninstall":                                   # also "uninstall /S" (Apps & Features, quiet)
         argv = ["uninstall"] + ["--silent" if x.upper() in ("/S", "/SILENT", "/QUIET") else x for x in argv[1:]]
     a = ap.parse_args(argv)
@@ -1473,6 +2071,32 @@ def main() -> None:
     elif a.cmd == "tray":
         import tray
         sys.exit(tray.run(a.data or DATA, a.selbsttest))
+    elif a.cmd == "gui":
+        import gui
+        sys.exit(gui.run(a.data or DATA, a.selbsttest))
+    elif a.cmd in ("tunnel", "backup", "admin-cmd"):
+        DATA = a.data or DATA
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+        try:
+            if a.cmd == "admin-cmd":
+                admin_cmd(a.request)
+            else:
+                {"tunnel": cli_tunnel, "backup": cli_backup}[a.cmd](a)
+        except (wgconf.ConfError, OSError) as e:
+            raise SystemExit(f"Fehler: {e}") from e
+    elif a.cmd == "qr-decode":
+        import qrdecode
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+        try:
+            print(qrdecode.decode_file(a.image))
+        except qrdecode.QRError as e:
+            raise SystemExit(f"Kein QR-Code lesbar: {e}") from e
     elif a.cmd == "run":
         DATA = a.data or DATA
         SIMULATE = a.simulate

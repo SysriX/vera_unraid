@@ -4,6 +4,10 @@ Public endpoints (signed by the device key, no login) – the only part of VERA 
     POST /client/enroll   {machine_id, public_key, hostname, domain, user, os, version, enroll_key}
     POST /client/poll     {config_hash, report{…}}  → {status, config_hash, tunnel, interval, …}
     POST /client/config   → {tunnel, text, hash}     (only for approved computers)
+    POST /client/backup/upload  {meta{…}, blob}  → {id}       backup of VERA-Connect (tunnels + settings), sealed on the
+    POST /client/backup/list    → {backups[…]}                computer with a passphrase VERA never sees; approved computers
+    POST /client/backup/get     {id} → {meta, blob}           only, own backups only (or copied to it by an admin)
+    POST /client/backup/delete  {id}
 
 Every request carries
     X-Device:    machine id
@@ -30,7 +34,7 @@ import httpx
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import JSON, DateTime, Integer, String, Text, select
+from sqlalchemy import JSON, DateTime, Integer, String, Text, func, select
 from sqlalchemy.orm import Mapped, mapped_column
 
 import core
@@ -65,6 +69,48 @@ class Client(Base):
     approved_by: Mapped[str] = mapped_column(String(128), default="")
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     history: Mapped[list] = mapped_column(JSON, default=list)               # last events (max 30)
+
+
+class Backup(Base):
+    """Backup of VERA-Connect: blob = JSON sealed by the client (PBKDF2 + HMAC-SHA256), meta = readable summary."""
+    __tablename__ = "vera_client_backup"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int] = mapped_column(Integer, index=True)
+    created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    blob: Mapped[str] = mapped_column(Text(length=4_000_000), default="")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    origin: Mapped[str] = mapped_column(String(128), default="")             # "" = from this computer, else "kopiert von …"
+
+
+BACKUP_MAX = 512_000
+
+
+def _local(dt) -> str:
+    if not dt:
+        return ""
+    if dt.tzinfo is None:                                                     # SQLite returns naive UTC
+        from datetime import timezone
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%d.%m.%Y %H:%M")
+
+
+def backup_dict(b: Backup) -> dict:
+    return {"id": b.id, "created": b.created.isoformat() if b.created else None, "created_local": _local(b.created),
+            "meta": b.meta or {}, "size": b.size, "origin": b.origin}
+
+
+def backup_keep() -> int:
+    try:
+        return max(1, min(200, int(setting("backup_keep", "20"))))
+    except ValueError:
+        return 20
+
+
+def _prune(s, client_id: int) -> None:
+    rows = s.scalars(select(Backup).where(Backup.client_id == client_id).order_by(Backup.created.desc(), Backup.id.desc())).all()
+    for b in rows[backup_keep():]:
+        s.delete(b)
 
 
 class Setting(Base):
@@ -190,7 +236,7 @@ def build_public_router(host) -> APIRouter:
         c, _, d = await _client(req)
         rep = d.get("report") or {}
         out = {"status": c.status, "interval": POLL_APPROVED if c.status == "approved" else POLL_PENDING,
-               "allow_disconnect": setting("allow_disconnect", "1") == "1"}
+               "allow_disconnect": setting("allow_disconnect", "1") == "1", "backup": True}
         cfg = None
         if c.status == "approved" and c.peer_id and c.firewall_id:
             try:
@@ -229,6 +275,72 @@ def build_public_router(host) -> APIRouter:
         core.audit(c.hostname or c.machine_id[:12], "VERA-Connect: Konfiguration abgeholt", c.tunnel,
                    ip=req.client.host if req.client else "")
         return {"tunnel": c.tunnel, "text": cfg["text"], "hash": cfg["hash"]}
+
+    # ---- backups of VERA-Connect (approved computers only)
+    async def _approved(req: Request) -> tuple[Client, dict]:
+        c, _, d = await _client(req)
+        if c.status != "approved":
+            raise HTTPException(403, "Rechner ist nicht freigegeben")
+        return c, d
+
+    @r.post("/client/backup/upload")
+    async def backup_upload(req: Request):
+        c, d = await _approved(req)
+        blob = d.get("blob")
+        if not isinstance(blob, str) or not blob or len(blob) > BACKUP_MAX:
+            raise HTTPException(400, f"Sicherung fehlt oder ist zu groß (max. {BACKUP_MAX // 1000} KB)")
+        try:
+            if json.loads(blob).get("format") != "vera-connect-sealed-1":
+                raise ValueError
+        except (ValueError, AttributeError) as e:
+            raise HTTPException(400, "Sicherung muss auf dem Rechner verschlüsselt sein") from e
+        m = d.get("meta") or {}
+        meta = {"tunnels": [str(x)[:32] for x in (m.get("tunnels") or [])][:50], "vera_tunnel": str(m.get("vera_tunnel") or "")[:32],
+                "default": str(m.get("default") or "")[:32], "client_version": str(m.get("client_version") or "")[:16],
+                "hostname": str(m.get("hostname") or c.hostname)[:64], "comment": str(m.get("comment") or "")[:200]}
+        with session() as s:
+            b = Backup(client_id=c.id, meta=meta, blob=blob, size=len(blob))
+            s.add(b)
+            s.flush()
+            bid = b.id
+            _prune(s, c.id)
+            x = s.get(Client, c.id)
+            _hist(x, f"Sicherung angelegt ({len(meta['tunnels'])} eigene Tunnel)")
+        core.audit(c.hostname or c.machine_id[:12], "VERA-Connect: Sicherung angelegt", meta["comment"],
+                   ip=req.client.host if req.client else "")
+        return {"id": bid, "keep": backup_keep()}
+
+    @r.post("/client/backup/list")
+    async def backup_list(req: Request):
+        c, _ = await _approved(req)
+        with session() as s:
+            rows = s.scalars(select(Backup).where(Backup.client_id == c.id).order_by(Backup.created.desc(), Backup.id.desc())).all()
+            return {"backups": [backup_dict(b) for b in rows], "keep": backup_keep()}
+
+    @r.post("/client/backup/get")
+    async def backup_get(req: Request):
+        c, d = await _approved(req)
+        with session() as s:
+            b = s.get(Backup, int(d.get("id") or 0))
+            if not b or b.client_id != c.id:
+                raise HTTPException(404, "Sicherung unbekannt")
+            out = {**backup_dict(b), "blob": b.blob}
+            x = s.get(Client, c.id)
+            _hist(x, f"Sicherung vom {out['created_local']} abgeholt")
+        core.audit(c.hostname or c.machine_id[:12], "VERA-Connect: Sicherung abgeholt", out["created_local"],
+                   ip=req.client.host if req.client else "")
+        return out
+
+    @r.post("/client/backup/delete")
+    async def backup_delete(req: Request):
+        c, d = await _approved(req)
+        with session() as s:
+            b = s.get(Backup, int(d.get("id") or 0))
+            if not b or b.client_id != c.id:
+                raise HTTPException(404, "Sicherung unbekannt")
+            s.delete(b)
+            _hist(s.get(Client, c.id), "Sicherung gelöscht")
+        return {"ok": True}
 
     return r
 
@@ -273,9 +385,49 @@ def build_admin_router(host, store) -> APIRouter:
     def list_clients(u=Depends(read)):
         peers = _peers()
         with session() as s:
-            rows = [client_dict(c, peers) for c in s.scalars(select(Client).order_by(Client.status != "pending", Client.hostname))]
+            counts = dict(s.execute(select(Backup.client_id, func.count(Backup.id)).group_by(Backup.client_id)).all())
+            rows = [client_dict(c, peers) | {"backups": counts.get(c.id, 0)}
+                    for c in s.scalars(select(Client).order_by(Client.status != "pending", Client.hostname))]
         return {"clients": rows, "enroll_key": setting("enroll_key") if u["level"] == "admin" else None,
-                "enroll_key_set": bool(setting("enroll_key")), "allow_disconnect": setting("allow_disconnect", "1") == "1"}
+                "enroll_key_set": bool(setting("enroll_key")), "allow_disconnect": setting("allow_disconnect", "1") == "1",
+                "backup_keep": backup_keep()}
+
+    @r.get("/{cid}/backups")
+    def client_backups(cid: int, u=Depends(read)):
+        with session() as s:
+            rows = s.scalars(select(Backup).where(Backup.client_id == cid).order_by(Backup.created.desc(), Backup.id.desc())).all()
+            return {"backups": [backup_dict(b) for b in rows], "keep": backup_keep()}
+
+    @r.delete("/{cid}/backups/{bid}")
+    def client_backup_delete(cid: int, bid: int, u=Depends(admin)):
+        with session() as s:
+            b = s.get(Backup, bid)
+            if not b or b.client_id != cid:
+                raise HTTPException(404, "Sicherung unbekannt")
+            s.delete(b)
+            c = s.get(Client, cid)
+            name = c.hostname if c else str(cid)
+            if c:
+                _hist(c, f"Sicherung gelöscht von {u['name']}")
+        host.audit(u, "VERA-Connect: Sicherung gelöscht", name)
+        return {"ok": True}
+
+    @r.post("/{cid}/backups/{bid}/copy")
+    async def client_backup_copy(cid: int, bid: int, req: Request, u=Depends(admin)):
+        """Hand a backup to another computer (e.g. new hardware) – it can restore it with the passphrase."""
+        target = int((await req.json()).get("target") or 0)
+        with session() as s:
+            b, src, dst = s.get(Backup, bid), s.get(Client, cid), s.get(Client, target)
+            if not b or b.client_id != cid or not src:
+                raise HTTPException(404, "Sicherung unbekannt")
+            if not dst or target == cid:
+                raise HTTPException(400, "Ziel-Rechner unbekannt")
+            s.add(Backup(client_id=target, meta=dict(b.meta or {}), blob=b.blob, size=b.size,
+                         origin=f"kopiert von {src.hostname or src.machine_id[:12]} ({_local(b.created)})"))
+            _hist(dst, f"Sicherung von {src.hostname} übertragen durch {u['name']}")
+            names = (src.hostname, dst.hostname)
+        host.audit(u, "VERA-Connect: Sicherung übertragen", f"{names[0]} → {names[1]}")
+        return {"ok": True}
 
     @r.post("/{cid}/approve")
     async def approve(cid: int, req: Request, u=Depends(admin)):
@@ -335,7 +487,12 @@ def build_admin_router(host, store) -> APIRouter:
                 raise HTTPException(404, "Rechner nicht gefunden")
             name = c.hostname
             s.delete(c)
-        host.audit(u, "VERA-Connect: Rechner entfernt", name, details="Der WireGuard-Zugang bleibt bestehen")
+            n = 0
+            for b in s.scalars(select(Backup).where(Backup.client_id == cid)).all():
+                s.delete(b)
+                n += 1
+        host.audit(u, "VERA-Connect: Rechner entfernt", name,
+                   details="Der WireGuard-Zugang bleibt bestehen" + (f", {n} Sicherung(en) gelöscht" if n else ""))
         return {"ok": True}
 
     @r.put("/settings")
@@ -346,8 +503,13 @@ def build_admin_router(host, store) -> APIRouter:
             set_setting("enroll_key", ("vk_" + secrets.token_urlsafe(18)) if v == "new" else "")
         if "allow_disconnect" in d:
             set_setting("allow_disconnect", "1" if d["allow_disconnect"] else "0")
+        if "backup_keep" in d:
+            try:
+                set_setting("backup_keep", str(max(1, min(200, int(d["backup_keep"] or 20)))))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(400, "Anzahl der Sicherungen: Zahl 1–200") from e
         host.audit(u, "VERA-Connect: Einstellungen geändert", "", details=json.dumps({k: (v if k != "enroll_key" else "…") for k, v in d.items()}))
-        return {"enroll_key": setting("enroll_key"), "allow_disconnect": setting("allow_disconnect", "1") == "1"}
+        return {"enroll_key": setting("enroll_key"), "allow_disconnect": setting("allow_disconnect", "1") == "1", "backup_keep": backup_keep()}
 
     # ---- installer with built-in settings (VERA address, update server, keys)
     @r.get("/installer/settings")
