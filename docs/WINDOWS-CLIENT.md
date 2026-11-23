@@ -100,6 +100,8 @@ vera-connect.exe backup delete <ID>
 vera-connect.exe qr-decode C:\pfad\bild.png        (jeder Benutzer: zeigt nur den Text des QR-Codes)
 ```
 
+In PowerShell-Skripten mit `| Out-String` aufrufen (z. B. `& vera-connect.exe backup list | Out-String`) – sonst wartet PowerShell nicht auf das Ende und `$LASTEXITCODE` stimmt nicht. In `cmd` und mit `Start-Process -Wait` wird ohnehin gewartet.
+
 Die Befehle gehen als Datei in `C:\ProgramData\VERA-Connect\cmd\` an den Dienst (nur SYSTEM und Administratoren dürfen dort schreiben und lesen; die Datei wird sofort nach dem Lesen gelöscht).
 
 ## Sicherheit

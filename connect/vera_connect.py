@@ -1255,7 +1255,7 @@ class Agent:
     def commands(self) -> bool:
         d = os.path.join(DATA, CMD_DIR)
         try:
-            files = sorted(f for f in os.listdir(d) if f.endswith(".req.json"))
+            files = sorted((f for f in os.listdir(d) if f.endswith(".req.json")), key=lambda f: os.path.getmtime(os.path.join(d, f)))
         except OSError:
             return False
         for f in files:
