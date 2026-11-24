@@ -57,7 +57,7 @@ import ed25519
 import netdetect
 import wgconf
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -171,9 +171,9 @@ def harden() -> None:
             _lock(_path(f))
 
 
-def run(cmd, timeout: int = 600) -> tuple[int, str]:
+def run(cmd, timeout: int = 600, env: dict | None = None) -> tuple[int, str]:
     try:
-        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, creationflags=NOWIN)
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, creationflags=NOWIN, env=env)
         raw = r.stdout + b"\n" + r.stderr
         out = raw.decode("utf-16-le", "replace") if b"\x00" in raw[:200] else raw.decode("utf-8", "replace")
         return r.returncode, out.strip()
@@ -222,7 +222,7 @@ def spawn_detached(args: list[str] | str, breakaway: bool = True) -> int:
     cmd = args if isinstance(args, str) else subprocess.list2cmdline(args)
     base = 0x00000008 | 0x00000200 | NOWIN                          # DETACHED_PROCESS, NEW_PROCESS_GROUP, NO_WINDOW
     err = 0
-    for flags in ((base | 0x01000000, base) if breakaway else (base,)):  # + CREATE_BREAKAWAY_FROM_JOB
+    for flags in ((base | 0x01000000,) if breakaway else (base,)):  # + CREATE_BREAKAWAY_FROM_JOB
         si, pi = SI(), PI()
         si.cb = ctypes.sizeof(SI)
         buf = ctypes.create_unicode_buffer(cmd)
@@ -231,7 +231,28 @@ def spawn_detached(args: list[str] | str, breakaway: bool = True) -> int:
             k.CloseHandle(pi.hProcess)
             return pi.dwProcessId
         err = ctypes.get_last_error()
-    raise OSError(err, f"Prozess nicht startbar ({ctypes.FormatError(err).strip()}): {cmd[:200]}")
+    if not breakaway:
+        raise OSError(err, f"Prozess nicht startbar ({ctypes.FormatError(err).strip()}): {cmd[:200]}")
+    # Breakaway refused: this process sits in a job (Nuitka onefile keeps its child in one) – a child would die
+    # together with it, i.e. as soon as the upgrade stops the service. Let WMI start it (outside every job),
+    # and as last resort a one-time scheduled task as SYSTEM.
+    log(f"Prozessstart ohne Job-Ausbruch verweigert ({err}) – starte über WMI")
+    env = dict(os.environ, VC_SPAWN_CMD=cmd)
+    c, o = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+                "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$env:VC_SPAWN_CMD}; "
+                "\"RC=$($r.ReturnValue) PID=$($r.ProcessId)\""], 120, env=env)
+    m = re.search(r"RC=0 PID=(\d+)", o)
+    if m:
+        return int(m.group(1))
+    log("WMI-Start fehlgeschlagen:", o[-300:], "– versuche geplante Aufgabe")
+    task = f"VERA-Connect-Spawn-{int(time.time())}"
+    when = time.strftime("%H:%M", time.localtime(time.time() + 120))
+    c, o = run(["schtasks.exe", "/Create", "/F", "/RU", "SYSTEM", "/SC", "ONCE", "/ST", when, "/TN", task, "/TR", cmd[:261]], 60)
+    if c == 0:
+        run(["schtasks.exe", "/Run", "/TN", task], 60)
+        spawn_detached(f'cmd.exe /c ping -n 120 127.0.0.1 >nul & schtasks.exe /Delete /F /TN "{task}"', breakaway=False)
+        return 0
+    raise OSError(err, f"Prozess nicht startbar (Job, WMI und geplante Aufgabe gescheitert): {o[-200:]}")
 
 
 # ------------------------------------------------------------------ DPAPI (keys and cached configuration)
@@ -1225,6 +1246,10 @@ class Agent:
             u = r.get("update")
             if not u:
                 return
+            if COMPILED and u.get("sha256") == own_sha256():           # same file under a higher version number
+                log(f"UMA bietet {u['version']} an – das ist aber genau diese EXE ({VERSION}); kein Update (Versionsnummer in UMA prüfen)")
+                set_status(update_state=f"UMA: {u['version']} ist dieselbe Datei wie {VERSION}")
+                return
             blob = self.uma_fetch(u, PROGRAM)
             d = os.path.join(DATA, "update")
             os.makedirs(d, exist_ok=True)
@@ -1992,6 +2017,20 @@ def uninstall(silent: bool) -> None:
         spawn_detached(f'cmd.exe /c ping -n 4 127.0.0.1 >nul & rmdir /s /q "{home_dir()}"', breakaway=False)
     if not silent:
         box("VERA-Connect wurde entfernt.")
+
+
+_OWN_SHA: str | None = None
+
+
+def own_sha256() -> str:
+    global _OWN_SHA
+    if _OWN_SHA is None:
+        try:
+            with open(os.path.abspath(sys.argv[0]), "rb") as f:
+                _OWN_SHA = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            _OWN_SHA = ""
+    return _OWN_SHA
 
 
 def replace_exe(src: str, target: str, tries: int = 15) -> bool:
