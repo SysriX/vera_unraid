@@ -26,10 +26,10 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 import wgconf
 
 TITLE = "VERA-Connect"
-STATE_TEXT = {"up": "verbunden", "idle": "aktiv (Handshake erst bei Verkehr)", "connecting": "verbindet …", "down": "keine Verbindung",
+STATE_TEXT = {"home": "im Heimnetz – pausiert", "up": "verbunden", "idle": "aktiv (Handshake erst bei Verkehr)", "connecting": "verbindet …", "down": "keine Verbindung",
               "missing": "fehlt – wird eingerichtet", "off": "getrennt"}
-STATE_COLOR = {"up": "#2eb67d", "idle": "#2eb67d", "connecting": "#f0b428", "down": "#dc4646", "missing": "#dc4646", "off": "#8c919a"}
-SERVICE_TEXT = {"up": "verbunden", "ready": "verbindet …", "down": "keine Verbindung – wird neu verbunden", "pending": "wartet auf Freigabe in VERA",
+STATE_COLOR = {"home": "#2f7fd8", "up": "#2eb67d", "idle": "#2eb67d", "connecting": "#f0b428", "down": "#dc4646", "missing": "#dc4646", "off": "#8c919a"}
+SERVICE_TEXT = {"home": "im Heimnetz – Tunnel pausiert", "up": "verbunden", "ready": "verbindet …", "down": "keine Verbindung – wird neu verbunden", "pending": "wartet auf Freigabe in VERA",
                 "start": "startet", "installing": "richtet WireGuard ein", "user_off": "getrennt", "offline": "VERA nicht erreichbar",
                 "error": "Fehler", "blocked": "in VERA gesperrt", "denied": "von VERA abgelehnt", "no_url": "Adresse von VERA fehlt",
                 "dead": "Dienst läuft nicht"}
@@ -156,7 +156,9 @@ class App:
         self.btn_ren = ttk.Button(b, text="Umbenennen …", command=self.rename)
         self.btn_del = ttk.Button(b, text="Löschen", command=self.delete)
         self.btn_def = ttk.Button(b, text="Als Standard", command=self.make_default)
-        for i, w in enumerate((self.btn_new, self.btn_file, self.btn_qr, self.btn_edit, self.btn_ren, self.btn_del, self.btn_def)):
+        self.btn_home = ttk.Button(b, text="Heimnetz …", command=self.home_dialog)
+        for i, w in enumerate((self.btn_new, self.btn_file, self.btn_qr, self.btn_edit, self.btn_ren, self.btn_del, self.btn_def,
+                               self.btn_home)):
             w.grid(row=i // 2, column=i % 2, sticky="ew", padx=2, pady=2)
         b.columnconfigure(0, weight=1)
         b.columnconfigure(1, weight=1)
@@ -174,7 +176,7 @@ class App:
         self.vals = {}
         fields = [("state", "Zustand"), ("origin", "Herkunft"), ("endpoint", "Endpunkt"), ("handshake", "Letzter Handshake"),
                   ("rx", "Empfangen"), ("tx", "Gesendet"), ("address", "Adresse"), ("dns", "DNS"), ("allowed", "Erlaubte Netze"),
-                  ("pub", "Öffentlicher Schlüssel")]
+                  ("pub", "Öffentlicher Schlüssel"), ("home", "Heimnetz-Erkennung")]
         for i, (k, t) in enumerate(fields):
             ttk.Label(info, text=t, style="K.TLabel").grid(row=i // 2, column=(i % 2) * 2, sticky="w", padx=(0, 8), pady=2)
             v = ttk.Label(info, text="–", wraplength=self.px(300))
@@ -279,7 +281,7 @@ class App:
 
     def details(self):
         t = self.row()
-        manage = [self.btn_edit, self.btn_ren, self.btn_del, self.btn_def]
+        manage = [self.btn_edit, self.btn_ren, self.btn_del, self.btn_def, self.btn_home]
         if not t:
             self.title.config(text="Noch kein Tunnel – „Neu“, „Aus Datei“ oder „Aus QR-Bild“")
             for v in self.vals.values():
@@ -303,6 +305,16 @@ class App:
         self.vals["dns"].config(text=t.get("dns") or "–")
         self.vals["allowed"].config(text=(t.get("allowed_ips") or "–") + ("  (ganzer Verkehr)" if t.get("full_tunnel") else ""))
         self.vals["pub"].config(text=t.get("public_key") or "–")
+        hc = t.get("home") or {}
+        if not hc.get("enabled", True):
+            htxt = "aus"
+        elif not t.get("home_networks"):
+            htxt = "keine Heimnetze (Tunnel leitet alles um – unter „Heimnetz …“ eintragen)"
+        else:
+            htxt = ", ".join(t["home_networks"]) + " · Prüfung: " + (hc.get("check") or "VERA")
+        if t.get("state") == "home" and t.get("home_why"):
+            htxt = "pausiert – " + t["home_why"] + "\n" + htxt
+        self.vals["home"].config(text=htxt)
         allowed = self.status.get("allow_disconnect", True) or t["source"] != "vera"
         if t["on"]:
             self.btn_toggle.config(text="Trennen" if allowed else "Trennen (in VERA nicht erlaubt)")
@@ -311,7 +323,7 @@ class App:
             self.btn_toggle.config(text="Verbinden")
             self.btn_toggle.state(["!disabled"])
         own = t["source"] != "vera"
-        for b, ok in ((self.btn_edit, own), (self.btn_ren, True), (self.btn_del, own), (self.btn_def, not t["default"])):
+        for b, ok in ((self.btn_edit, own), (self.btn_ren, True), (self.btn_del, own), (self.btn_def, not t["default"]), (self.btn_home, True)):
             b.state(["!disabled"] if ok and not self.busy else ["disabled"])
 
     # ------------------------------------------------------------------ graph
@@ -579,6 +591,43 @@ class App:
         t = self.row()
         if t:
             self.command({"action": "default", "name": t["name"]}, lambda r: self._after_change(t["name"], "Standard-Tunnel gesetzt"))
+
+    def home_dialog(self):
+        t = self.row()
+        if not t:
+            return
+        hc = t.get("home") or {}
+        d = tk.Toplevel(self.root)
+        d.title(f"Heimnetz-Erkennung – {t['name']}")
+        d.transient(self.root)
+        f = ttk.Frame(d, padding=14)
+        f.pack(fill="both", expand=True)
+        ev = tk.BooleanVar(value=hc.get("enabled", True))
+        nv, cv = tk.StringVar(value=", ".join(hc.get("networks") or [])), tk.StringVar(value=hc.get("check") or "")
+        ttk.Checkbutton(f, text="Tunnel automatisch pausieren, wenn der Rechner im Heimnetz ist", variable=ev).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(f, text="So wird erkannt: Ein aktiver Netzwerkadapter (nicht WireGuard) hat eine Adresse in einem der Heimnetze, "
+                          "und die Prüfadresse antwortet direkt über diesen Adapter – bei VERA mit der bekannten Kennung. "
+                          "Ein fremdes Netz mit gleichem Adressbereich (Hotel, Kunde) zählt daher nicht. "
+                          "Wird das Netz verlassen, verbindet sich der Tunnel wieder.", wraplength=self.px(620), justify="left",
+                  style="K.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 10))
+        auto = ", ".join(t.get("home_networks") or []) if not hc.get("networks") else ""
+        ttk.Label(f, text="Heimnetze").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(f, textvariable=nv, width=44).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(f, text=f"leer = aus AllowedIPs des Tunnels{(' (jetzt: ' + auto + ')') if auto else ''}; bei 0.0.0.0/0 hier eintragen, z. B. 192.168.99.0/24",
+                  style="K.TLabel").grid(row=3, column=1, sticky="w")
+        ttk.Label(f, text="Prüfadresse").grid(row=4, column=0, sticky="w", pady=(10, 4))
+        ttk.Entry(f, textvariable=cv, width=44).grid(row=4, column=1, sticky="w", pady=(10, 4))
+        ttk.Label(f, text="leer = VERA (empfohlen); sonst host:port, z. B. 192.168.99.1:443 – muss im Heimnetz liegen",
+                  style="K.TLabel").grid(row=5, column=1, sticky="w")
+
+        def ok():
+            req = {"action": "home", "name": t["name"], "enabled": ev.get(), "networks": nv.get(), "check": cv.get()}
+            d.destroy()
+            self.command(req, lambda r: self._after_change(t["name"], "Heimnetz-Erkennung gespeichert"))
+        bar = ttk.Frame(f)
+        bar.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(bar, text="Speichern", command=ok).pack(side="left", padx=6)
+        ttk.Button(bar, text="Abbrechen", command=d.destroy).pack(side="left")
 
     # ----- backup
     def backup_create(self):

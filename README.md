@@ -6,6 +6,7 @@
 
 `ghcr.io/sysrix/vera:latest`
 
+> **Stand 1.3.1:** VERA-Connect 1.3 mit Heimnetz-Erkennung (Tunnel pausiert im eigenen Netz) – Zustand „im Heimnetz“ in den Rechner-Details.
 > **Stand 1.3.0:** Sicherungen von VERA-Connect 1.2 (verschlüsselt auf dem Rechner, Versionsliste, Übertragen auf einen anderen Rechner), eigene Tunnel der Rechner in den Details sichtbar.
 > **Stand 1.2.0:** Windows-Client **VERA-Connect** und Seite „Rechner“ (Freigabe) – Ablauf getestet, WireGuard dabei simuliert; die EXE wird bei GitHub auf frischem Windows mit echtem WireGuard getestet.
 > **Stand 1.1.0:** Kopplung mit MIRA (Erkennung, API-Schlüssel, Plugin) – getestet mit MIRA 0.3.0.

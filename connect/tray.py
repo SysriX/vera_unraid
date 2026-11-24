@@ -89,16 +89,16 @@ class POINT(ctypes.Structure):
 
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 
-COLORS = {"up": (46, 182, 125), "ready": (240, 180, 40), "down": (220, 70, 70), "pending": (240, 180, 40), "start": (240, 180, 40),
+COLORS = {"home": (46, 182, 125), "up": (46, 182, 125), "ready": (240, 180, 40), "down": (220, 70, 70), "pending": (240, 180, 40), "start": (240, 180, 40),
           "installing": (240, 180, 40), "user_off": (77, 195, 255), "offline": (220, 70, 70), "error": (220, 70, 70),
           "blocked": (220, 70, 70), "denied": (220, 70, 70), "no_url": (240, 180, 40), "dead": (130, 130, 130)}
-STATE_TEXT = {"up": "verbunden", "ready": "verbindet …", "down": "keine Verbindung – wird neu verbunden", "pending": "wartet auf Freigabe in VERA",
+STATE_TEXT = {"home": "im Heimnetz – Tunnel pausiert", "up": "verbunden", "ready": "verbindet …", "down": "keine Verbindung – wird neu verbunden", "pending": "wartet auf Freigabe in VERA",
               "start": "startet", "installing": "richtet WireGuard ein", "user_off": "getrennt (von Hand)", "offline": "VERA nicht erreichbar",
               "error": "Fehler", "blocked": "in VERA gesperrt", "denied": "von VERA abgelehnt", "no_url": "Adresse von VERA fehlt",
               "dead": "Dienst läuft nicht"}
 
 
-TUNNEL_TEXT = {"up": "verbunden", "idle": "aktiv", "connecting": "verbindet …", "down": "keine Verbindung", "missing": "fehlt", "off": "getrennt"}
+TUNNEL_TEXT = {"home": "im Heimnetz (pausiert)", "up": "verbunden", "idle": "aktiv", "connecting": "verbindet …", "down": "keine Verbindung", "missing": "fehlt", "off": "getrennt"}
 
 
 # ------------------------------------------------------------------ icons: the VERA shield (app/web/icon.svg) + status dot

@@ -36,7 +36,7 @@ jobs:
           "VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           $env:PYTHONPATH = "connect"
           python -m nuitka --onefile --assume-yes-for-downloads --enable-plugin=tk-inter --include-module=winservice --include-module=tray `
-            --include-module=ed25519 --include-module=wgconf --include-module=qrdecode --include-module=gui `
+            --include-module=ed25519 --include-module=wgconf --include-module=qrdecode --include-module=gui --include-module=netdetect `
             --windows-console-mode=attach --windows-icon-from-ico=connect/vera-connect.ico --python-flag=no_asserts --python-flag=no_docstrings `
             --windows-company-name=SysriX --windows-product-name="VERA-Connect" --windows-file-description="VERA-Connect (WireGuard-Verbindung zu VERA)" `
             --windows-file-version=$v --windows-product-version=$v --output-filename=VERA-Connect-Setup.exe --output-dir=dist connect/vera_connect.py

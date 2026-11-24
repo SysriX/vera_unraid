@@ -7,6 +7,7 @@
     vera-connect.exe uninstall | status | version | configure | tray | gui
     vera-connect.exe run [--data DIR] [--simulate]              foreground (the service runs this); --simulate = no WireGuard changes
     vera-connect.exe tunnel list|import FILE|import-qr IMAGE|connect|disconnect|default|rename|delete …   (administrator)
+    vera-connect.exe tunnel home NAME on|off [--networks 192.168.99.0/24] [--check host:port]             (administrator)
     vera-connect.exe backup create|list|restore ID|delete ID                                            (administrator)
     vera-connect.exe qr-decode IMAGE                                                                    (any user)
 
@@ -23,6 +24,9 @@ Each can be connected on its own; the default tunnel connects after a restart of
 all traffic (0.0.0.0/0). The window (`gui`) shows every tunnel live (handshake, endpoint, transfer with rate graph) and
 manages them; changes go to the service as commands in cmd\\ (administrators only). Backups: tunnels + settings,
 sealed with a passphrase, stored in VERA (/client/backup/*), with a list of versions and restore.
+Since 1.3: home network detection – a tunnel pauses while an active adapter (not WireGuard) has an address in a network the
+tunnel reaches (AllowedIPs or own list) and VERA answers directly through that adapter with its known instance id
+(or an own check address answers); it reconnects when the network is left.
 The user may disconnect in the tray (the VERA tunnel only if VERA allows it); it stays off until "Verbinden" or the next restart.
 Standard library only (+ ed25519.py). Windows: service "VeraConnect", data in C:\\ProgramData\\VERA-Connect.
 """
@@ -47,11 +51,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 import ed25519
+import netdetect
 import wgconf
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -727,7 +733,11 @@ class Agent:
         self.uma_wg = None
         self.rt: dict[str, dict] = {}                       # per tunnel: started, pause, next_restart
         self._summaries: dict[str, tuple] = {}
+        self.home_cache: dict[str, dict] = {}
+        self._local: list = []
+        self.net_fp, self.next_net, self._inst_t = None, 0.0, 0.0
         self.state.setdefault("local", {})
+        self.state.setdefault("home", {})
         if self.state.get("user_off") is None:
             self.state["user_off"] = False
         boot = boot_time()
@@ -855,7 +865,9 @@ class Agent:
                         "dns": ", ".join(s.get("dns", [])), "endpoint": live.get("endpoint") or peers[0].get("endpoint", ""),
                         "allowed_ips": ", ".join(a for p in s.get("peers", []) for a in p["allowed_ips"]),
                         "public_key": s.get("public_key", ""), "full_tunnel": bool(s.get("full_tunnel")),
-                        "last_handshake": live.get("last_handshake", 0), "origin": self.local.get(n, {}).get("origin", "VERA")})
+                        "last_handshake": live.get("last_handshake", 0), "origin": self.local.get(n, {}).get("origin", "VERA"),
+                        "home": self.home_cfg(n), "home_networks": [str(x) for x in self.home_networks(n)],
+                        "home_why": self.rt.get(n, {}).get("home_why", "")})
         return out
 
     def report(self) -> dict:
@@ -908,6 +920,7 @@ class Agent:
                 self.state["allow_disconnect"] = allow
                 self.keep()
             set_status(server_ok=time.time(), allow_disconnect=allow, vera=c["url"], backup=bool(r.get("backup")))
+            self.learn_instance(c["url"])
             self.next_poll = time.time() + (POLL_MIN if os.environ.get("VC_FAST") else max(POLL_MIN, int(r.get("interval") or 60)))
             st = r.get("status")
             if st == "pending":
@@ -939,6 +952,94 @@ class Agent:
                        last_error=why)
             log("VERA nicht erreichbar:", why, "|", repr(e)[:300])
             self.next_poll = time.time() + 120
+
+    def learn_instance(self, url: str) -> None:
+        """Instance id of VERA (/.well-known/sysrix-app) – proves later that the VERA in a local network is ours."""
+        if time.time() - self._inst_t < 3600 and self.state.get("vera_instance"):
+            return
+        self._inst_t = time.time()
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url.rstrip("/") + "/.well-known/sysrix-app",
+                                                               headers={"User-Agent": f"{APP}/{VERSION}"}), timeout=15, context=_ssl) as r:
+                inst = json.loads(r.read(4000)).get("instance")
+            if inst and inst != self.state.get("vera_instance"):
+                self.state["vera_instance"] = inst
+                self.keep()
+        except (OSError, ValueError) as e:
+            log("Kennung von VERA nicht lesbar:", e)
+
+    # ----- home network detection
+    def home_cfg(self, name: str) -> dict:
+        c = self.state["home"].get(name) or {}
+        return {"enabled": c.get("enabled", True), "networks": list(c.get("networks") or []), "check": c.get("check") or ""}
+
+    def tunnel_ips(self) -> set:
+        return {a.split("/")[0] for n in self.names() for a in self.summary(n).get("address", [])}
+
+    def refresh_local(self) -> bool:
+        """Addresses of the active adapters; True if they changed since the last look."""
+        try:
+            self._local = netdetect.local_ipv4(self.tunnel_ips(), DATA if SIMULATE else None)
+        except Exception as e:  # noqa: BLE001
+            log("Netzwerkadapter nicht lesbar:", e)
+            self._local = []
+        fp = tuple(sorted((ip, pre) for ip, pre, _ in self._local))
+        changed = fp != self.net_fp
+        if changed and self.net_fp is not None:
+            log("Netzwerk geändert:", ", ".join(f"{ip}/{pre}" for ip, pre in fp) or "keine Adresse")
+        self.net_fp = fp
+        return changed
+
+    def home_networks(self, name: str) -> list:
+        return netdetect.networks_of(self.summary(name), self.home_cfg(name)["networks"])
+
+    def at_home(self, name: str) -> tuple[bool, str]:
+        cfg = self.home_cfg(name)
+        if not cfg["enabled"]:
+            return False, ""
+        nets = self.home_networks(name)
+        m = netdetect.match(self._local, nets) if nets else None
+        if not m:
+            self.home_cache.pop(name, None)
+            return False, ""
+        key = (m[0], str(m[1]), cfg["check"], self.conf.get("url"), self.state.get("vera_instance"))
+        c = self.home_cache.get(name)
+        if c and c["key"] == key and time.time() - c["t"] < (600 if c["home"] else 120):
+            return c["home"], c["why"]
+        home, why = self.verify_home(m[0], nets, cfg["check"])
+        self.home_cache[name] = {"key": key, "t": time.time(), "home": home, "why": why}
+        if not home:
+            log(f"Tunnel {name}: Adresse {m[0]} liegt in {m[1]}, aber kein Heimnetz – {why}")
+        return home, why
+
+    def verify_home(self, local_ip: str, nets: list, check: str) -> tuple[bool, str]:
+        """Is the check address (default: VERA) reachable directly through the local adapter? Its address must lie in
+        one of the tunnel networks – a public address would also answer from any hotel network."""
+        import ipaddress
+        if check:
+            u = urlsplit(check if "://" in check else "tcp://" + check)
+            host, port = u.hostname or "", u.port or 443
+            addrs = netdetect.resolve4(host)
+            if not any(ipaddress.ip_address(a) in n for a in addrs for n in nets):
+                return False, f"Prüfadresse {host} liegt nicht in den Heimnetzen"
+            ok = netdetect.probe_tcp(host, port, local_ip)
+            return ok, f"{host}:{port} direkt erreichbar über {local_ip}" if ok else f"{host}:{port} über {local_ip} nicht erreichbar"
+        url = self.conf.get("url") or ""
+        host = urlsplit(url).hostname or ""
+        if not host:
+            return False, "Adresse von VERA fehlt"
+        inst = self.state.get("vera_instance")
+        if not inst:
+            return False, "Kennung von VERA noch unbekannt"
+        addrs = netdetect.resolve4(host)
+        if not any(ipaddress.ip_address(a) in n for a in addrs for n in nets):
+            return False, f"VERA ({host} → {', '.join(addrs) or '?'}) liegt nicht in den Heimnetzen"
+        d = netdetect.probe_vera(url, local_ip, _ssl)
+        if not d:
+            return False, f"VERA über {local_ip} nicht erreichbar"
+        if d.get("instance") != inst:
+            return False, "dort antwortet ein anderes VERA"
+        return True, f"VERA direkt erreichbar über {local_ip}"
 
     def fetch_and_apply(self) -> None:
         r = request(self.dev, self.conf["url"], "POST", "/client/config", {})
@@ -1151,6 +1252,7 @@ class Agent:
         if not names:
             set_status(tunnel_state="waiting", tunnels=[])
             return
+        self.refresh_local()
         dump = self.wg.dump() if any(self.is_on(n) for n in names) else {}
         for n in names:
             try:
@@ -1168,10 +1270,12 @@ class Agent:
             state = "down"
         elif any(r["state"] == "connecting" for r in on):
             state = "ready"
+        elif all(r["state"] == "home" for r in on):
+            state = "home"
         else:
             state = "up"
         prim = next((r for r in on if r["default"]), on[0] if on else None)
-        extra = {"state": state, **({"message": ""} if state == "up" else {})}
+        extra = {"state": state, **({"message": ""} if state in ("up", "home") else {})}
         tstate = ("user_off" if not vt["on"] else vt["state"]) if vt else "waiting"
         set_status(tunnel_state={"idle": "up", "connecting": "down", "off": "user_off"}.get(tstate, tstate), tunnels=rows,
                    tunnel=prim["name"] if prim else self.default_name(), default=self.default_name(),
@@ -1185,6 +1289,18 @@ class Agent:
                 self.wg.remove_tunnel(n)
             r["state"] = "off"
             return
+        home, why = self.at_home(n)
+        if home:                                                    # in the home network: no tunnel needed
+            if s != "MISSING":
+                self.wg.remove_tunnel(n)
+            if r.get("state") != "home":
+                self.event(f"Tunnel {n} pausiert – im Heimnetz ({why})")
+            r.update(state="home", home_why=why)
+            return
+        if r.get("state") == "home":
+            self.event(f"Tunnel {n}: Heimnetz verlassen – wird wieder verbunden")
+            r.update(state="connecting", started=time.time(), home_why="")
+            s = self.wg.svc_state(n)
         if s == "MISSING":
             text = self.config_of(n)
             if not text:
@@ -1350,6 +1466,9 @@ class Agent:
             was_on = self.is_on(old)
             if self.wg.svc_state(old) != "MISSING":
                 self.wg.remove_tunnel(old)
+            if old in self.state["home"]:
+                self.state["home"][new] = self.state["home"].pop(old)
+            self.home_cache.pop(old, None)
             if old == self.vera_name():
                 c = self.conf
                 c["tunnel"] = new
@@ -1369,12 +1488,34 @@ class Agent:
                 raise CmdError("Der Tunnel von VERA lässt sich hier nicht löschen (in VERA sperren oder entfernen)")
             self.wg.remove_tunnel(name)
             del self.local[name]
+            self.state["home"].pop(name, None)
             if self.state.get("default") == name:
                 self.state["default"] = None
             self.rt.pop(name, None)
             self.keep()
             self.event(f"Tunnel {name} gelöscht")
             return {}
+        if a == "home":
+            name = self.find(req.get("name"))
+            if not name:
+                raise CmdError("Tunnel unbekannt")
+            import ipaddress
+            nets = req.get("networks") or []
+            if isinstance(nets, str):
+                nets = [x for x in re.split(r"[,;\s]+", nets) if x]
+            for x in nets:
+                try:
+                    if ipaddress.ip_network(x, strict=False).version != 4:
+                        raise ValueError
+                except ValueError as e:
+                    raise CmdError(f"„{x}“ ist kein IPv4-Netz (z. B. 192.168.99.0/24)") from e
+            check = str(req.get("check") or "").strip()[:200]
+            self.state["home"][name] = {"enabled": bool(req.get("enabled", True)), "networks": nets, "check": check}
+            self.home_cache.pop(name, None)
+            self.keep()
+            self.event(f"Heimnetz-Erkennung für {name}: {'an' if req.get('enabled', True) else 'aus'}"
+                       + (f", Netze {', '.join(nets)}" if nets else "") + (f", Prüfung {check}" if check else ""))
+            return {"name": name}
         if a == "default":
             name = self.find(req.get("name"))
             if not name:
@@ -1406,10 +1547,11 @@ class Agent:
     def backup_create(self, passphrase: str, comment: str) -> dict:
         c = self.conf
         tunnels = [{"name": n, "config": self.config_of(n), "on": self.is_on(n), "origin": t.get("origin", ""),
-                    "created": t.get("created")} for n, t in sorted(self.local.items())]
+                    "created": t.get("created"), "home": self.home_cfg(n)} for n, t in sorted(self.local.items())]
         payload = {"format": "vera-connect-backup", "version": 1, "client_version": VERSION, "created": time.time(),
                    "hostname": self.dev.facts.get("hostname", ""), "default": self.default_name(), "vera_tunnel": self.vera_name(),
-                   "settings": {k: c.get(k, "") for k in ("url", "update_url", "update_key", "tunnel")}, "tunnels": tunnels}
+                   "settings": {k: c.get(k, "") for k in ("url", "update_url", "update_key", "tunnel")}, "tunnels": tunnels,
+                   "vera_home": self.home_cfg(self.vera_name()) if self.vera_name() else None}
         blob = wgconf.seal(payload, passphrase)
         meta = {"tunnels": [t["name"] for t in tunnels], "vera_tunnel": self.vera_name() or "", "default": self.default_name() or "",
                 "client_version": VERSION, "hostname": payload["hostname"], "comment": comment}
@@ -1431,11 +1573,16 @@ class Agent:
                 name = name[:28] + "-alt"
             new[name] = {"config": protect(text.encode()), "on": bool(t.get("on")), "created": t.get("created") or time.time(),
                          "origin": (t.get("origin") or "Sicherung")[:40]}
+            if isinstance(t.get("home"), dict):
+                self.state["home"][name] = t["home"]
         for n in list(self.local):                                  # replace the own tunnels completely
             if n not in new or self.config_of(n) != unprotect(new[n]["config"]).decode():
                 self.wg.remove_tunnel(n)
                 self.rt.pop(n, None)
         self.state["local"] = new
+        if isinstance(data.get("vera_home"), dict) and self.vera_name():
+            self.state["home"][self.vera_name()] = data["vera_home"]
+        self.home_cache.clear()
         d = data.get("default")
         if d == data.get("vera_tunnel") and self.vera_name():
             d = self.vera_name()
@@ -1490,6 +1637,11 @@ class Agent:
                 try:
                     if self.pending_flags() or self.commands():
                         break
+                    if time.time() >= self.next_net:
+                        self.next_net = time.time() + 5
+                        if self.refresh_local() and self.names():
+                            self.home_cache.clear()
+                            break
                     self.live()
                 except Exception as e:  # noqa: BLE001
                     log("Fehler:", e)
@@ -1950,7 +2102,9 @@ def cli_tunnel(a) -> None:
         st = load("status.json")
         for t in st.get("tunnels") or []:
             print(f"{'*' if t['default'] else ' '} {t['name']:<32} {'VERA ' if t['source'] == 'vera' else 'eigen'} "
-                  f"{'an ' if t['on'] else 'aus'} {t['state']:<10} {t.get('endpoint', '')}")
+                  f"{'an ' if t['on'] else 'aus'} {t['state']:<10} {t.get('endpoint', '')}"
+                  + (f"  Heimnetz: {', '.join(t.get('home_networks') or []) or '–'}" if (t.get("home") or {}).get("enabled", True) else "  Heimnetz: aus")
+                  + (f" ({t['home_why']})" if t.get("home_why") else ""))
         return
     req = {"action": a.action, "name": a.name}
     if a.action in ("import", "import-qr"):
@@ -1966,6 +2120,8 @@ def cli_tunnel(a) -> None:
                "origin": origin, "connect": a.connect}
     elif a.action == "rename":
         req["new"] = a.new
+    elif a.action == "home":                                       # tunnel home <Name> on|off [--networks …] [--check …]
+        req.update(enabled=(a.new or "on").lower() not in ("off", "aus", "0"), networks=a.networks, check=a.check)
     _cli_result(send_command(req))
 
 
@@ -2020,10 +2176,12 @@ def main() -> None:
     gu.add_argument("--data", default="")
     gu.add_argument("--selbsttest", type=float, default=0, help=argparse.SUPPRESS)
     tu = sub.add_parser("tunnel", help="Tunnel verwalten (Administrator)")
-    tu.add_argument("action", choices=["list", "import", "import-qr", "connect", "disconnect", "default", "rename", "delete"])
+    tu.add_argument("action", choices=["list", "import", "import-qr", "connect", "disconnect", "default", "rename", "delete", "home"])
     tu.add_argument("name", nargs="?", default="", help="Tunnel bzw. Datei/Bild beim Import")
     tu.add_argument("new", nargs="?", default="", help="neuer Name (rename) bzw. Name beim Import")
     tu.add_argument("--connect", action="store_true", help="nach dem Import verbinden")
+    tu.add_argument("--networks", default="", help="home: eigene Heimnetze, z. B. 192.168.99.0/24 (leer = aus AllowedIPs)")
+    tu.add_argument("--check", default="", help="home: eigene Prüfadresse host:port (leer = VERA)")
     tu.add_argument("--data", default="")
     bk = sub.add_parser("backup", help="Sicherung in VERA (Administrator; Kennwort aus VC_BACKUP_PASSPHRASE oder Abfrage)")
     bk.add_argument("action", choices=["create", "list", "restore", "delete"])

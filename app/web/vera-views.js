@@ -136,7 +136,7 @@ function veraViews(ctx) {
 
   // ---------------------------------------------------------------- VERA-Connect computers
   const CLIENT_STATE = { pending: ["wartet auf Freigabe", "warn"], approved: ["freigegeben", "ok"], blocked: ["gesperrt", "bad"] };
-  const TUNNEL_STATE = { up: ["verbunden", "ok"], down: ["keine Verbindung", "bad"], user_off: ["vom Benutzer getrennt", "warn"],
+  const TUNNEL_STATE = { home: ["im Heimnetz (pausiert)", "ok"], up: ["verbunden", "ok"], down: ["keine Verbindung", "bad"], user_off: ["vom Benutzer getrennt", "warn"],
     missing: ["Tunnel fehlt", "bad"], installing: ["wird eingerichtet", "warn"], waiting: ["wartet", "warn"] };
 
   async function approveDialog(c) {
@@ -177,7 +177,7 @@ function veraViews(ctx) {
     if (r) ctx.rerender();
   }
 
-  const OWN_STATE = { up: ["verbunden", "ok"], idle: ["aktiv", "ok"], connecting: ["verbindet", "warn"], down: ["keine Verbindung", "bad"],
+  const OWN_STATE = { home: ["im Heimnetz (pausiert)", "ok"], up: ["verbunden", "ok"], idle: ["aktiv", "ok"], connecting: ["verbindet", "warn"], down: ["keine Verbindung", "bad"],
     missing: ["fehlt", "bad"], off: ["getrennt", ""] };
 
   async function backupsBox(c, box, others) {

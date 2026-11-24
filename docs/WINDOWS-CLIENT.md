@@ -2,6 +2,7 @@
 
 Ein Windows-Programm, das sich seine WireGuard-Konfiguration selbst von VERA holt, WireGuard installiert und aktuell hält, den Tunnel überwacht und sich selbst über [UMA](https://github.com/SysriX/uma_unraid) aktualisiert. Rechner einmal installieren und in VERA freigeben – danach kümmert sich niemand mehr darum, auch nicht nach einem Konfigurationsverlust, neuen Schlüsseln oder einem WireGuard-Update.
 
+> **Stand 1.3.0 (mit VERA 1.3.1):** Heimnetz-Erkennung – ist der Rechner im Netz, das ein Tunnel erreicht (z. B. 192.168.99.0/24), und antwortet VERA dort direkt, pausiert der Tunnel; beim Verlassen verbindet er wieder.
 > **Stand 1.2.0 (mit VERA 1.3.0):** Fenster mit Live-Anzeige je Tunnel (Handshake, Endpunkt, Übertragung mit Rate und Grafik), mehrere Tunnel (eigene neben dem von VERA: anlegen, umbenennen, löschen, einzeln verbinden/trennen, Standard-Tunnel), Import aus `.conf` und aus einem Bild mit QR-Code, verschlüsselte Sicherung in VERA mit Versionsliste und Wiederherstellen.
 > **Stand 1.1.5:** Installer mit eingebauten Einstellungen (VERA › Rechner), Verbindung prüfen im Tray, IPv4 zuerst, Kette über Windows-Prüfung.
 > **Stand 1.1.1:** unvollständige Zertifikatsketten werden ausgeglichen, Fehler im Tray mit Grund.
@@ -61,6 +62,7 @@ Menü: **VERA-Connect öffnen** (auch per Doppelklick) · **Tunnel ›** jeder T
 | **Neu …** | Editor mit frischem Schlüsselpaar und Vorlage; der öffentliche Schlüssel wird angezeigt (bei der Gegenstelle eintragen). Die Konfiguration wird beim Tippen geprüft |
 | **Aus Datei (.conf) …** | WireGuard-Konfiguration übernehmen (Name aus dem Dateinamen, änderbar) |
 | **Aus QR-Bild …** | Bilddatei wählen oder den Pfad eintippen (PNG, JPEG, BMP, GIF, TIFF) – z. B. der QR-Code aus VERA, einer FRITZ!Box, OPNsense oder ein Bildschirmfoto. Der Code wird auf dem Rechner gelesen (eigener Leser, nichts geht ins Internet), danach wie beim Datei-Import prüfen und speichern |
+| **Heimnetz …** | Heimnetz-Erkennung je Tunnel: an/aus, eigene Heimnetze, eigene Prüfadresse (siehe unten) |
 | **Bearbeiten / Umbenennen / Löschen / Als Standard** | eigene Tunnel frei; der Tunnel von VERA lässt sich nur umbenennen und als Standard setzen (Inhalt kommt aus VERA, Löschen über Sperren in VERA) |
 | **Sicherung in VERA** | „Jetzt sichern …“ (Kommentar + Kennwort) und „Versionen / wiederherstellen …“ (Liste mit Zeitpunkt, Rechner, Tunneln, Version, Kommentar; Wiederherstellen mit Kennwort, wahlweise auch die Adressen von VERA/UMA; Löschen) |
 
@@ -74,6 +76,21 @@ Lesen darf jeder Benutzer; **Verbinden/Trennen** auch (über `ui\`). Alles ander
 - **Getrennte Tunnel** sind in Windows nicht als Dienst eingerichtet (starten also auch nicht von selbst); ihre Konfiguration liegt verschlüsselt (DPAPI) in `state.json`.
 - **VERA sieht** im Bericht des Rechners Name, Herkunft und Zustand aller Tunnel (keine Schlüssel) – VERA › Rechner › Details.
 - **Entfernen** von VERA-Connect entfernt alle Tunnel-Dienste; die eigenen Tunnel bleiben (getrennt) für eine Neuinstallation gespeichert.
+
+### Heimnetz-Erkennung (Tunnel im eigenen Netz pausieren)
+
+Ist der Rechner im Netz, das ein Tunnel ohnehin erreicht, braucht er den Tunnel nicht – VERA-Connect pausiert ihn dann von selbst:
+
+1. Alle paar Sekunden liest der Dienst die IPv4-Adressen der **aktiven** Netzwerkadapter (WireGuard/Wintun-Adapter, Loopback und 169.254.x.x zählen nicht).
+2. Liegt eine davon in einem **Heimnetz** des Tunnels, wird geprüft. Heimnetze sind die `AllowedIPs` des Tunnels (ohne `0.0.0.0/0`) oder – unter „Heimnetz …“ – eigene Netze. Beispiel: Adapter hat `192.168.99.57`, Tunnel erreicht `192.168.99.0/24`.
+3. **Prüfung:** VERA muss in einem der Heimnetze liegen (Name löst intern dorthin auf) und **direkt über diesen Adapter** antworten – die Anfrage geht mit der Adapter-Adresse als Absender raus, nicht durch den Tunnel – und zwar mit der Kennung (`instance`) des VERA, das der Client aus dem normalen Betrieb kennt. Ein Hotel- oder Kundennetz mit zufällig gleichem Adressbereich zählt deshalb nicht. Statt VERA kann je Tunnel eine eigene Prüfadresse `host:port` eingetragen werden (dann reicht eine TCP-Verbindung; die Adresse muss im Heimnetz liegen).
+4. Bestanden → Tunnel **pausiert** (Windows-Dienst entfernt, Zustand „im Heimnetz – pausiert“, im Protokoll und in VERA sichtbar). Das Netz wird verlassen (Adresse weg/anders) → innerhalb von Sekunden **wieder verbunden**. Positive Prüfungen gelten 10 Minuten, negative 2 Minuten, jede Netzänderung prüft sofort neu.
+
+Hinweise:
+- Standardmäßig **an** für jeden Tunnel; abschaltbar je Tunnel (Fenster › „Heimnetz …“ bzw. `vera-connect.exe tunnel home <Name> off`).
+- Tunnel mit `0.0.0.0/0` haben keine eigenen Heimnetze – dort das Netz eintragen: `vera-connect.exe tunnel home <Name> on --networks 192.168.99.0/24`.
+- Liegt VERA in einem anderen internen Netz als der Rechner (z. B. Server-VLAN), muss dieses Netz zu den Heimnetzen gehören – oder eine Prüfadresse im Netz des Rechners nehmen (z. B. die Firewall `192.168.99.1:443`).
+- Die Einstellungen gehören zur Sicherung in VERA.
 
 ### Sicherung in VERA
 
@@ -92,6 +109,7 @@ vera-connect.exe tunnel import C:\pfad\buero.conf [Name] [--connect]
 vera-connect.exe tunnel import-qr C:\pfad\qr.png [Name] [--connect]
 vera-connect.exe tunnel connect|disconnect|default|delete <Name>
 vera-connect.exe tunnel rename <Name> <NeuerName>
+vera-connect.exe tunnel home <Name> on|off [--networks 192.168.99.0/24,…] [--check host:port]
 set VC_BACKUP_PASSPHRASE=…   (sonst wird nach dem Kennwort gefragt)
 vera-connect.exe backup create [--comment "…"]
 vera-connect.exe backup list
