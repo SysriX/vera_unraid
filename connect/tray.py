@@ -307,7 +307,7 @@ class Tray:
         except OSError:
             return
         self.restarting = True
-        subprocess.Popen(f'cmd.exe /c ping -n 4 127.0.0.1 >nul & start "" "{exe}" tray', stdin=subprocess.DEVNULL, close_fds=True,
+        subprocess.Popen(f'cmd.exe /c ping -n 4 127.0.0.1 >nul & start "" "{exe}" tray', stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
                          creationflags=0x00000008 | 0x08000000)
         user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
 
@@ -411,7 +411,7 @@ class Tray:
         compiled = "__compiled__" in vars(sys.modules["__main__"]) or getattr(sys, "frozen", False)
         args = [os.path.abspath(sys.argv[0]), "gui", "--data", self.data] if compiled else             [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vera_connect.py"), "gui", "--data", self.data]
         try:
-            subprocess.Popen(args, stdin=subprocess.DEVNULL, close_fds=True, creationflags=0x00000008 | 0x00000200 | 0x08000000)
+            subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, creationflags=0x00000008 | 0x00000200 | 0x08000000)
         except OSError as e:
             user32.MessageBoxW(None, f"Fenster lässt sich nicht öffnen: {e}", "VERA-Connect", 0x30)
 

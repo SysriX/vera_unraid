@@ -57,7 +57,7 @@ import ed25519
 import netdetect
 import wgconf
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -194,6 +194,44 @@ def powershell(script: str, timeout: int = 300) -> tuple[int, str]:
             os.remove(p)
         except OSError:
             pass
+
+
+def spawn_detached(args: list[str] | str, breakaway: bool = True) -> int:
+    """Start a process that outlives this one – directly with CreateProcessW and *no* inherited handles.
+    subprocess.Popen fails in the service with WinError 6 (it tries to pass on standard handles a service does not
+    have). Without breakaway permission (job without JOB_OBJECT_LIMIT_BREAKAWAY_OK) the second try goes without it."""
+    if not WIN:
+        return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True).pid
+    from ctypes import wintypes
+
+    class SI(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR), ("lpDesktop", wintypes.LPWSTR), ("lpTitle", wintypes.LPWSTR),
+                    ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD), ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD),
+                    ("dwXCountChars", wintypes.DWORD), ("dwYCountChars", wintypes.DWORD), ("dwFillAttribute", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD),
+                    ("lpReserved2", ctypes.c_void_p), ("hStdInput", wintypes.HANDLE), ("hStdOutput", wintypes.HANDLE),
+                    ("hStdError", wintypes.HANDLE)]
+
+    class PI(ctypes.Structure):
+        _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE), ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
+                                 ctypes.c_void_p, wintypes.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p]
+    cmd = args if isinstance(args, str) else subprocess.list2cmdline(args)
+    base = 0x00000008 | 0x00000200 | NOWIN                          # DETACHED_PROCESS, NEW_PROCESS_GROUP, NO_WINDOW
+    err = 0
+    for flags in ((base | 0x01000000, base) if breakaway else (base,)):  # + CREATE_BREAKAWAY_FROM_JOB
+        si, pi = SI(), PI()
+        si.cb = ctypes.sizeof(SI)
+        buf = ctypes.create_unicode_buffer(cmd)
+        if k.CreateProcessW(None, buf, None, None, False, flags, None, None, ctypes.byref(si), ctypes.byref(pi)):
+            k.CloseHandle(pi.hThread)
+            k.CloseHandle(pi.hProcess)
+            return pi.dwProcessId
+        err = ctypes.get_last_error()
+    raise OSError(err, f"Prozess nicht startbar ({ctypes.FormatError(err).strip()}): {cmd[:200]}")
 
 
 # ------------------------------------------------------------------ DPAPI (keys and cached configuration)
@@ -1198,14 +1236,15 @@ class Agent:
                 log("[simuliert/nicht kompiliert] Selbst-Update übersprungen:", new)
                 return
             target = os.path.join(home_dir(), "vera-connect.exe")
-            subprocess.Popen([new, "upgrade", "--target", target], stdin=subprocess.DEVNULL, close_fds=True,
-                             creationflags=0x00000008 | 0x00000200 | 0x01000000 | NOWIN)   # detached, new group, breakaway
+            pid = spawn_detached([new, "upgrade", "--target", target])
+            log(f"Update-Prozess gestartet (PID {pid})")
         except HttpError as e:
             log("Update-Server:", e)
             set_status(update_state=f"Fehler: {e.detail}")
             self.next_self = time.time() + 3600
         except Exception as e:  # noqa: BLE001
-            log("Selbst-Update:", e)
+            import traceback
+            log("Selbst-Update:", e, traceback.format_exc()[-700:])
             set_status(update_state=f"Fehler: {e}")
             self.next_self = time.time() + 3600
 
@@ -1893,12 +1932,14 @@ def install(p: dict) -> None:
             if winservice._query_state() is not None:
                 winservice.stop()
             os.makedirs(home_dir(), exist_ok=True)
-            for _ in range(10):
-                try:
-                    shutil.copy2(me, target)
-                    break
-                except OSError:
-                    time.sleep(1)
+            try:                                                   # the tray of this session holds the EXE open
+                import tray
+                if tray.close_running():
+                    time.sleep(2)
+            except Exception:  # noqa: BLE001
+                pass
+            if not replace_exe(me, target):
+                raise SystemExit(f"{target} ist gesperrt und ließ sich nicht ersetzen – VERA-Connect-Fenster/Tray schließen und erneut starten.")
             sys.argv[0] = target
     winservice.install(DATA)
     harden()
@@ -1914,7 +1955,7 @@ def start_tray() -> None:
     if u.endswith("$") or u == "SYSTEM" or not COMPILED:
         return
     try:
-        subprocess.Popen([exe_path(), "tray"], stdin=subprocess.DEVNULL, close_fds=True, creationflags=0x00000008 | 0x00000200)
+        subprocess.Popen([exe_path(), "tray"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, creationflags=0x00000008 | 0x00000200)
     except OSError as e:
         log("Tray-Start:", e)
 
@@ -1948,10 +1989,28 @@ def uninstall(silent: bool) -> None:
     _reg(UNINSTALL_KEY, None)
     log(f"{APP} entfernt (Geräteschlüssel bleibt – bei Neuinstallation erkennt VERA den Rechner wieder)")
     if COMPILED and os.path.isdir(home_dir()):
-        subprocess.Popen(f'cmd.exe /c ping -n 4 127.0.0.1 >nul & rmdir /s /q "{home_dir()}"', stdin=subprocess.DEVNULL, close_fds=True,
-                         creationflags=0x00000008 | NOWIN)
+        spawn_detached(f'cmd.exe /c ping -n 4 127.0.0.1 >nul & rmdir /s /q "{home_dir()}"', breakaway=False)
     if not silent:
         box("VERA-Connect wurde entfernt.")
+
+
+def replace_exe(src: str, target: str, tries: int = 15) -> bool:
+    """Copy the new EXE over the installed one. A running EXE (tray/window of a logged-on user) cannot be overwritten,
+    but renamed: it keeps running from the old file, every new start uses the new one (*.old-* removed later)."""
+    for _ in range(tries):
+        try:
+            shutil.copy2(src, target)
+            return True
+        except OSError:
+            try:
+                old = f"{target}.old-{int(time.time())}"
+                os.replace(target, old)
+                shutil.copy2(src, target)
+                log("Laufende EXE umbenannt nach", os.path.basename(old), "– neue Version liegt bereit")
+                return True
+            except OSError:
+                time.sleep(1)
+    return False
 
 
 def upgrade(target: str) -> None:
@@ -1959,23 +2018,7 @@ def upgrade(target: str) -> None:
     import winservice
     log(f"Selbst-Update auf {VERSION}: ersetze {target}")
     winservice.stop()
-    me = os.path.abspath(sys.argv[0])
-    for i in range(30):
-        try:
-            shutil.copy2(me, target)
-            break
-        except OSError:
-            # still running (tray/window of a logged-on user): a running EXE cannot be overwritten, but renamed –
-            # it keeps running from the old file, the next start uses the new one
-            try:
-                old = f"{target}.old-{int(time.time())}"
-                os.replace(target, old)
-                shutil.copy2(me, target)
-                log("Selbst-Update: laufende EXE umbenannt nach", os.path.basename(old))
-                break
-            except OSError:
-                time.sleep(1)
-    else:
+    if not replace_exe(os.path.abspath(sys.argv[0]), target, 30):
         log("Selbst-Update: Datei blieb gesperrt – alte Version läuft weiter")
     _reg(UNINSTALL_KEY, {"DisplayVersion": VERSION})
     winservice.start()

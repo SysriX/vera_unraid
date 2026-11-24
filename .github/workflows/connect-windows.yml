@@ -140,6 +140,18 @@ jobs:
           if ($run -notmatch 'vera-connect\.exe" tray') { throw "Tray-Autostart fehlt" }
           $t = Start-Process "$env:ProgramFiles\VERA-Connect\vera-connect.exe" -ArgumentList "tray","--selbsttest","3" -PassThru -Wait -NoNewWindow
           if ($t.ExitCode -ne 0) { throw "Tray-Selbsttest" }
+          "--- Setup erneut ausführen, während der Tray läuft (EXE gesperrt)"
+          $tr = Start-Process $vc -ArgumentList "tray" -PassThru
+          Start-Sleep 4
+          Copy-Item .\dist\VERA-Connect-Setup.exe neu.exe
+          [IO.File]::AppendAllText("$PWD\neu.exe", "`nVERA-CONNECT-CONFIG:{`"url`": `"http://127.0.0.1:18110`"}`n")
+          $p = Start-Process .\neu.exe -ArgumentList '/S' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "Setup über laufenden Tray: Code $($p.ExitCode)" }
+          $h1 = (Get-FileHash neu.exe).Hash; $h2 = (Get-FileHash $vc).Hash
+          if ($h1 -ne $h2) { Get-Content "$env:ProgramData\VERA-Connect\connect.log" -Tail 15; throw "Installierte EXE wurde nicht ersetzt" }
+          Get-ChildItem "$env:ProgramFiles\VERA-Connect" | Select-Object Name, Length
+          if (-not ((sc.exe query VeraConnect) -match 'RUNNING')) { throw "Dienst läuft nach erneutem Setup nicht" }
+          Write-Host "::notice title=Test::Setup bei laufendem Tray ersetzt die EXE"
           "--- Apps & Features"
           Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VERA-Connect' | Select-Object DisplayName, DisplayVersion, UninstallString
           Write-Host "::notice title=Test::Tray-Selbsttest ok"
