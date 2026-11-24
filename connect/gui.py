@@ -89,7 +89,7 @@ class App:
         self.busy = 0
         self.last_touch = 0.0
         self.root = tk.Tk()
-        self.root.title(TITLE)
+        self.root.title(f"{TITLE} {self._version()}")
         self.k = max(1.0, self.root.winfo_fpixels("1i") / 96)              # Windows display scaling (125 %, 150 % …)
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         self.root.geometry(f"{min(int(1080 * self.k), int(sw * 0.92))}x{min(int(690 * self.k), int(sh * 0.88))}")
@@ -104,6 +104,10 @@ class App:
         st.configure("Treeview", rowheight=self.px(22))
         self._build()
         self.tick()
+
+    @staticmethod
+    def _version() -> str:
+        return str(getattr(_vc(), "VERSION", "") or "")
 
     def px(self, n: float) -> int:
         return int(n * self.k)
@@ -124,6 +128,8 @@ class App:
         top = ttk.Frame(r, padding=(12, 10, 12, 4))
         top.pack(fill="x")
         ttk.Label(top, text="VERA-Connect", style="H.TLabel").pack(side="left")
+        self.ver = ttk.Label(top, text=f"Version {self._version()}", style="K.TLabel")
+        self.ver.pack(side="left", padx=(8, 0))
         self.svc = ttk.Label(top, text="", style="K.TLabel")
         self.svc.pack(side="left", padx=14)
         if not self.admin:
@@ -242,6 +248,9 @@ class App:
         state = st.get("state", "dead")
         if not st or (time.time() - float(st.get("updated") or 0) > 300):
             state = "dead"
+        mine, sv = self._version(), st.get("version")
+        self.ver.config(text=f"Version {mine}" + (f" · Dienst {sv}" if sv and sv != mine else "")
+                        + (f" · WireGuard {st['wg_version']}" if st.get("wg_version") else ""))
         self.svc.config(text=f"Dienst: {SERVICE_TEXT.get(state, state)}" + (f" – {st['message']}" if st.get("message") else ""))
         rows = st.get("tunnels") or []
         names = [t["name"] for t in rows]
@@ -726,7 +735,7 @@ def _single_instance() -> bool:
         k.CreateMutexW(None, False, "Local\\VeraConnectWindow")
         if k.GetLastError() == 183:                                    # already open → bring to front
             u = ctypes.windll.user32
-            h = u.FindWindowW(None, TITLE)
+            h = u.FindWindowW(None, f"{TITLE} {App._version()}")
             if h:
                 u.ShowWindow(h, 9)
                 u.SetForegroundWindow(h)

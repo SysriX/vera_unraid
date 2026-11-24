@@ -2,6 +2,7 @@
 
 Ein Windows-Programm, das sich seine WireGuard-Konfiguration selbst von VERA holt, WireGuard installiert und aktuell hält, den Tunnel überwacht und sich selbst über [UMA](https://github.com/SysriX/uma_unraid) aktualisiert. Rechner einmal installieren und in VERA freigeben – danach kümmert sich niemand mehr darum, auch nicht nach einem Konfigurationsverlust, neuen Schlüsseln oder einem WireGuard-Update.
 
+> **Stand 1.3.1:** Version gut sichtbar: oberster (grauer) Eintrag im Tray-Menü „VERA-Connect 1.3.1“, im Tooltip, im Fensterkopf (mit WireGuard-Version) und unter „Status anzeigen“; weicht der Dienst ab (gerade aktualisiert), steht seine Version dahinter.
 > **Stand 1.3.0 (mit VERA 1.3.1):** Heimnetz-Erkennung – ist der Rechner im Netz, das ein Tunnel erreicht (z. B. 192.168.99.0/24), und antwortet VERA dort direkt, pausiert der Tunnel; beim Verlassen verbindet er wieder.
 > **Stand 1.2.0 (mit VERA 1.3.0):** Fenster mit Live-Anzeige je Tunnel (Handshake, Endpunkt, Übertragung mit Rate und Grafik), mehrere Tunnel (eigene neben dem von VERA: anlegen, umbenennen, löschen, einzeln verbinden/trennen, Standard-Tunnel), Import aus `.conf` und aus einem Bild mit QR-Code, verschlüsselte Sicherung in VERA mit Versionsliste und Wiederherstellen.
 > **Stand 1.1.5:** Installer mit eingebauten Einstellungen (VERA › Rechner), Verbindung prüfen im Tray, IPv4 zuerst, Kette über Windows-Prüfung.
@@ -49,7 +50,7 @@ Ist VERA nicht erreichbar, bleibt die letzte Konfiguration aktiv.
 
 Symbol mit Statuspunkt: grün = verbunden · gelb = wartet auf Freigabe / verbindet · blau = von Hand getrennt · rot = keine Verbindung / gesperrt · grau = Dienst läuft nicht.
 
-Menü: **VERA-Connect öffnen** (auch per Doppelklick) · **Tunnel ›** jeder Tunnel einzeln an/aus (Haken = verbunden, ★ = Standard) · **Verbinden** (Standard-Tunnel) / **Alle trennen** · Konfiguration neu holen · Status · Verbindung prüfen · Protokoll · Einstellungen (Administrator). Den Tunnel von VERA trennen geht nur, wenn VERA es erlaubt (Schalter unter Rechner). Von Hand getrennt bleibt ein Tunnel bis „Verbinden“ oder bis zum nächsten Neustart von Windows.
+Menü: oben grau die **laufende Version** („VERA-Connect 1.3.1“) und der Zustand · **VERA-Connect öffnen** (auch per Doppelklick) · **Tunnel ›** jeder Tunnel einzeln an/aus (Haken = verbunden, ★ = Standard) · **Verbinden** (Standard-Tunnel) / **Alle trennen** · Konfiguration neu holen · Status · Verbindung prüfen · Protokoll · Einstellungen (Administrator). Den Tunnel von VERA trennen geht nur, wenn VERA es erlaubt (Schalter unter Rechner). Von Hand getrennt bleibt ein Tunnel bis „Verbinden“ oder bis zum nächsten Neustart von Windows.
 
 ## Fenster: Tunnel live, verwalten, importieren, sichern
 

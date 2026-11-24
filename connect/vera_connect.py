@@ -57,7 +57,7 @@ import ed25519
 import netdetect
 import wgconf
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -1278,6 +1278,7 @@ class Agent:
         extra = {"state": state, **({"message": ""} if state in ("up", "home") else {})}
         tstate = ("user_off" if not vt["on"] else vt["state"]) if vt else "waiting"
         set_status(tunnel_state={"idle": "up", "connecting": "down", "off": "user_off"}.get(tstate, tstate), tunnels=rows,
+                   wg_version=self.wg.version() if self.wg.installed() else "",
                    tunnel=prim["name"] if prim else self.default_name(), default=self.default_name(),
                    last_handshake=(prim or {}).get("last_handshake", 0), **extra)
 

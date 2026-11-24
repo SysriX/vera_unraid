@@ -224,8 +224,19 @@ def _ago(t) -> str:
     return "gerade eben" if d < 60 else f"vor {d // 60} min" if d < 3600 else f"vor {d // 3600} h"
 
 
+def my_version() -> str:
+    return str(getattr(sys.modules.get("__main__"), "VERSION", "") or "")
+
+
+def version_line(st: dict) -> str:
+    """"VERA-Connect 1.3.1" – plus the version of the service if it differs (e.g. right after an update)."""
+    mine = my_version() or st.get("version") or "?"
+    svc = st.get("version")
+    return f"VERA-Connect {mine}" + (f" (Dienst {svc})" if svc and svc != mine else "")
+
+
 def tip_text(st: dict) -> str:
-    t = f"VERA-Connect – {STATE_TEXT.get(st['shown'], st['shown'])}"
+    t = f"{version_line(st)} – {STATE_TEXT.get(st['shown'], st['shown'])}"
     if st.get("tunnel"):
         t += f"\nTunnel: {st['tunnel']}"
     return t[:127]
@@ -248,7 +259,7 @@ def details(st: dict) -> str:
         lines.append(f"Updates: {st['update_state']}")
     if st.get("last_error"):
         lines.append(f"Letzter Fehler: {st['last_error']}")
-    lines += ["", f"VERA-Connect {st.get('version', '?')}"]
+    lines += ["", version_line(st) + (f" · WireGuard {st['wg_version']}" if st.get("wg_version") else "")]
     return "\n".join(lines)
 
 
@@ -320,7 +331,9 @@ class Tray:
     def menu(self):
         st = self.st
         m = user32.CreatePopupMenu()
-        user32.AppendMenuW(m, MF_STRING | MF_GRAYED, 0, tip_text(st).replace("\n", " · ")[:100])
+        user32.AppendMenuW(m, MF_STRING | MF_GRAYED, 0, version_line(st)[:100])
+        user32.AppendMenuW(m, MF_STRING | MF_GRAYED, 0, STATE_TEXT.get(st["shown"], st["shown"])[:100]
+                           + (f" · Tunnel {st['tunnel']}" if st.get("tunnel") else ""))
         user32.AppendMenuW(m, MF_SEPARATOR, 0, None)
         alive = st["shown"] != "dead"
         user32.AppendMenuW(m, MF_STRING, CMD_WINDOW, "VERA-Connect öffnen …")
