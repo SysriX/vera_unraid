@@ -177,6 +177,56 @@ function veraViews(ctx) {
     if (r) ctx.rerender();
   }
 
+  // ---- device identity ("Geräte-Ausweis"): hardware fingerprint, pinned key, credential signed by VERA
+  let fpLabels = {};
+  const STORAGE = { dpapi: "DPAPI (Datei, an diesen Rechner gebunden)", tpm: "TPM (nicht exportierbar)", file: "Datei" };
+  const MATCH = { same: "gleiche Hardware", partial: "ähnliche Hardware (ein Teil getauscht)", different: "andere Hardware" };
+
+  function idHints(c) {
+    const x = [];
+    if (c.suggested_id && c.status === "pending") x.push(marke(`${c.match_quality === "same" ? "gleiche" : "ähnliche"} Hardware wie ${c.suggested_name || "#" + c.suggested_id}`, "warn"));
+    if (c.pending_key) x.push(marke("neuer Geräteschlüssel wartet", "warn"));
+    if (c.key_revoked) x.push(marke("Schlüssel gesperrt", "bad"));
+    return x.length ? h("div", { class: "leiste" }, ...x) : null;
+  }
+
+  function fpTable(fp, other) {
+    const keys = Object.keys(fpLabels).filter(k => (fp || {})[k] || (other || {})[k]);
+    if (!keys.length) return h("p", { class: "leise klein-t" }, "Keine Hardware-Werte gemeldet (VERA-Connect vor 1.4).");
+    const cols = [{ t: "Merkmal", w: k => fpLabels[k] }, { t: other ? "bisher" : "Wert", w: k => h("code", { class: "klein-t" }, (other || fp)[k] || "–") }];
+    if (other) cols.push({ t: "neu", w: k => h("code", { class: "klein-t" + ((fp[k] || "") !== (other[k] || "") ? " rot" : "") }, fp[k] || "–") });
+    return tabelle(cols, keys);
+  }
+
+  async function replaceDialog(c, all) {
+    const targets = (all || []).filter(o => o.id !== c.id && o.status !== "pending");
+    if (!targets.length) { hinweis("Es gibt keinen bekannten Rechner zum Umtragen", true); return false; }
+    const sel = auswahl("target", targets.map(o => [o.id, `${o.hostname || o.machine_id.slice(0, 12)} (${o.username || "–"})${o.id === c.suggested_id ? " – gleiche Hardware" : ""}`]),
+      c.suggested_id || targets[0].id);
+    const cmp = h("div", {});
+    const draw = () => { const t = targets.find(o => o.id === Number(sel.value)) || {}; leeren(cmp, fpTable(c.fingerprint || {}, t.fingerprint || {})); };
+    sel.addEventListener("change", draw); draw();
+    const r = await dialog(`${c.hostname || "Rechner"} umtragen`, h("div", {},
+      h("p", { class: "klein-t" }, "Der wartende Rechner (neue Hardware oder neu installiertes Windows) übernimmt den gewählten Eintrag: WireGuard-Zugang, Tunnel, Sicherungen und Verlauf bleiben erhalten. Der alte Geräteschlüssel wird gesperrt."),
+      feld("Übernimmt den Eintrag von", sel), h("h4", {}, "Hardware-Vergleich"), cmp),
+      [["Abbrechen", null], ["Umtragen", () => versuch(() => ctx.api("POST", `/api/clients/${c.id}/replace`, { target: Number(sel.value) }), "Umgetragen – Ausweis ausgestellt"), "p"]]);
+    if (r) ctx.rerender();
+    return r;
+  }
+
+  async function acceptKeyDialog(c) {
+    const r = await dialog(`Neuen Geräteschlüssel von ${c.hostname} übernehmen?`, h("div", {},
+      h("p", { class: "klein-t" }, `Seit ${datum(c.pending_since)} meldet sich dieser Rechner (gleiche Rechner-Kennung) mit einem neuen Schlüssel ${c.pending_key} – z. B. nach Neuinstallation von VERA-Connect. Bis zur Übernahme gilt weiter der alte Schlüssel ${c.key_fingerprint}.`),
+      h("p", { class: "klein-t" }, "Hardware: ", marke(MATCH[c.pending_match] || "unbekannt", c.pending_match === "same" ? "ok" : "warn")),
+      fpTable(c.pending_fp || {}, c.fingerprint || {}),
+      h("p", { class: "leise klein-t" }, "Übernehmen sperrt den alten Schlüssel und stellt einen neuen Ausweis aus. Ablehnen sperrt den neuen Schlüssel.")),
+      [["Abbrechen", null],
+       ["Ablehnen", () => versuch(() => ctx.api("POST", `/api/clients/${c.id}/discard_key`), "Neuer Schlüssel abgelehnt"), "gefahr"],
+       ["Übernehmen", () => versuch(() => ctx.api("POST", `/api/clients/${c.id}/accept_key`), "Schlüssel übernommen"), "p"]]);
+    if (r) ctx.rerender();
+    return r;
+  }
+
   const OWN_STATE = { home: ["im Heimnetz (pausiert)", "ok"], up: ["verbunden", "ok"], idle: ["aktiv", "ok"], connecting: ["verbindet", "warn"], down: ["keine Verbindung", "bad"],
     missing: ["fehlt", "bad"], off: ["getrennt", ""] };
 
@@ -216,11 +266,18 @@ function veraViews(ctx) {
     const ts = c.status !== "approved" ? ["–", ""] : TUNNEL_STATE[rep.tunnel_state] || [rep.tunnel_state || "–", ""];
     const a = ctx.can("admin");
     const kn = [["Schließen", null]];
-    if (a && c.status !== "approved") kn.unshift(["Freigeben …", () => { approveDialog(c); return true; }, "p"]);
+    if (a && c.status !== "approved" && !c.key_revoked) kn.unshift(["Freigeben …", () => { approveDialog(c); return true; }, c.suggested_id ? "" : "p"]);
+    if (a && c.status === "pending") kn.unshift(["Umtragen …", () => { replaceDialog(c, all); return true; }, c.suggested_id ? "p" : ""]);
+    if (a && c.pending_key) kn.unshift(["Neuen Schlüssel prüfen …", () => { acceptKeyDialog(c); return true; }, "p"]);
     if (a && c.status === "approved") kn.unshift(["Zuordnung ändern …", () => { approveDialog(c); return true; }]);
-    if (a && c.status !== "blocked") kn.unshift(["Sperren", async () => {
-      if (!(await bestaetigen(`${c.hostname} sperren? Der Rechner bekommt keine Konfiguration mehr und entfernt seinen Tunnel.`, "Sperren"))) return false;
-      await versuch(() => ctx.api("POST", `/api/clients/${c.id}/block`), "Gesperrt"); ctx.rerender();
+    if (a && c.status !== "blocked") kn.unshift(["Sperren …", async () => {
+      const rev = h("input", { type: "checkbox" });
+      const ok = await dialog(`${c.hostname} sperren?`, h("div", {},
+        h("p", { class: "klein-t" }, "Der Rechner bekommt keine Konfiguration mehr und entfernt seinen Tunnel."),
+        h("label", { class: "klein-t" }, rev, " Geräteschlüssel dauerhaft sperren (Sperrliste) – der Rechner muss VERA-Connect neu anmelden, der neue Schlüssel wird dann übernommen und neu freigegeben")),
+        [["Abbrechen", null], ["Sperren", () => versuch(() => ctx.api("POST", `/api/clients/${c.id}/block`, { revoke: rev.checked }), "Gesperrt"), "gefahr"]]);
+      if (ok) ctx.rerender();
+      return ok;
     }, "gefahr"]);
     if (a) kn.unshift(["Entfernen", async () => {
       if (!(await bestaetigen(`${c.hostname} aus der Liste entfernen? Meldet er sich wieder, steht er erneut zur Freigabe an. Der WireGuard-Zugang bleibt bestehen.`, "Entfernen"))) return false;
@@ -241,7 +298,15 @@ function veraViews(ctx) {
         tabelle([{ t: "Name", w: t => h("span", {}, t.default ? "★ " : "", t.name) }, { t: "Herkunft", w: t => t.source === "vera" ? "VERA" : "eigener (Import/QR/von Hand)" },
           { t: "Zustand", w: t => t.on ? marke(...(OWN_STATE[t.state] || [t.state, ""])) : marke("getrennt", "") }], rep.tunnels)) : null,
       rep.error ? h("pre", {}, rep.error) : null,
-      h("p", { class: "leise klein-t" }, `Kennung ${c.machine_id} · Geräteschlüssel ${c.key_fingerprint}` + (c.approved_by ? ` · freigegeben von ${c.approved_by} am ${datum(c.approved_at)}` : "")),
+      h("p", { class: "leise klein-t" }, `Kennung ${c.machine_id}` + (c.approved_by ? ` · freigegeben von ${c.approved_by} am ${datum(c.approved_at)}` : "")),
+      h("h4", {}, "Geräte-Ausweis"),
+      idHints(c),
+      h("div", { class: "raster" },
+        feld("Geräteschlüssel", h("div", {}, h("code", {}, c.key_fingerprint || "–"), c.key_revoked ? h("div", { class: "rot klein-t" }, "gesperrt") : null)),
+        feld("Schlüsselspeicher", h("div", {}, STORAGE[c.key_storage] || c.key_storage || "–")),
+        feld("Ausweis", h("div", {}, c.credential_at ? `ausgestellt ${datum(c.credential_at)}` : h("span", { class: "leise" }, "noch keiner (erst nach Freigabe)"))),
+        c.pending_key ? feld("Neuer Schlüssel wartet", h("div", {}, h("code", {}, c.pending_key), h("div", { class: "klein-t" }, `seit ${datum(c.pending_since)} · ${MATCH[c.pending_match] || "?"}`))) : null),
+      fpTable(c.fingerprint || {}),
       h("h4", {}, `Sicherungen von VERA-Connect${c.backups ? ` (${c.backups})` : ""}`), bbox,
       h("h4", {}, "Verlauf"),
       tabelle([{ t: "Zeit", w: x => datum(x.t) }, { t: "Ereignis", w: x => x.e }], c.history.slice(0, 15), { leer: "–" })), kn);
@@ -255,6 +320,7 @@ function veraViews(ctx) {
         feld("Adresse von VERA *", eingabe("vera_url", i.vera_url || i.suggest_vera_url, { placeholder: "https://vera.<Domain>" }), "so erreichen die Rechner VERA (von außen: nur /client/ nötig)"),
         feld("Update-Server (UMA)", eingabe("update_url", i.update_url, { placeholder: "https://update.<Domain> – leer = keine Selbst-Updates" })),
         feld("UMA-Signaturschlüssel", eingabe("update_key", i.update_key, { placeholder: "optional – UMA › Programme › Signaturschlüssel" }), "leer = wird beim ersten Kontakt gemerkt"),
+        feld("UMA-Anmeldeschlüssel", eingabe("uma_enroll_key", i.uma_enroll_key, { placeholder: "optional – uk_… aus UMA" }), "gibt die Rechner in UMA sofort frei; leer = sie warten dort auf Freigabe"),
         feld("Name des Tunnels", eingabe("tunnel", i.tunnel, { placeholder: "optional – sonst aus der Freigabe" }))),
       h("p", { class: "leise klein-t" }, i.enroll_key_set ? "Der Anmelde-Schlüssel wird automatisch mit eingebaut." : "Kein Anmelde-Schlüssel gesetzt – jeder Rechner mit diesem Installer erscheint zur Freigabe."));
     const old = i.base && i.base.version && (i.base.version.split(".").map(Number).reduce((x, n) => x * 1000 + n, 0) < 1001005);
@@ -283,6 +349,7 @@ function veraViews(ctx) {
 
   views.clients = { titel: "Rechner", zeigen: async main => {
     const d = await ctx.api("GET", "/api/clients");
+    fpLabels = d.fp_labels || {};
     const a = ctx.can("admin");
     const pending = d.clients.filter(c => c.status === "pending");
     const keyLine = a ? h("div", { class: "leiste" },
@@ -302,16 +369,19 @@ function veraViews(ctx) {
       { t: "", w: c => punkt(CLIENT_STATE[c.status][1]) },
       { t: "Rechner", w: c => h("div", {}, h("b", {}, c.hostname || c.machine_id.slice(0, 12)), h("div", { class: "leise klein-t" }, c.domain || "")) },
       { t: "Benutzer", w: c => c.username || "–" },
-      { t: "Status", w: c => h("div", {}, marke(...CLIENT_STATE[c.status]), c.note ? h("div", { class: "klein-t" }, c.note) : null) },
+      { t: "Status", w: c => h("div", {}, marke(...CLIENT_STATE[c.status]), c.note ? h("div", { class: "klein-t" }, c.note) : null, idHints(c)) },
       { t: "Tunnel", w: c => c.status === "approved" ? marke(...(TUNNEL_STATE[(c.report || {}).tunnel_state] || ["–", ""])) : "" },
       { t: "Zugang", w: c => c.peer_name || "–" },
       { t: "Versionen", w: c => h("span", { class: "klein-t" }, `${c.client_version || "?"} · WG ${c.wg_version || "–"}`) },
       { t: "Tunnel/Sicherungen", w: c => h("span", { class: "klein-t" }, `${((c.report || {}).tunnels || []).length || (c.tunnel ? 1 : 0)} · ${c.backups || 0}`) },
       { t: "Zuletzt", w: c => h("span", { class: "klein-t" }, datum(c.last_seen), h("div", { class: "leise" }, c.last_ip)) },
-      { t: "", w: c => a && c.status === "pending" ? h("button", { class: "p klein", onclick: e => { e.stopPropagation(); approveDialog(c); } }, "Freigeben") : "" }];
+      { t: "", w: c => !a ? "" : h("span", { class: "leiste" },
+        c.status === "pending" && c.suggested_id ? h("button", { class: "p klein", onclick: e => { e.stopPropagation(); replaceDialog(c, d.clients); } }, "Umtragen …") : null,
+        c.status === "pending" && !c.key_revoked ? h("button", { class: (c.suggested_id ? "" : "p ") + "klein", onclick: e => { e.stopPropagation(); approveDialog(c); } }, "Freigeben") : null,
+        c.pending_key ? h("button", { class: "p klein", onclick: e => { e.stopPropagation(); acceptKeyDialog(c); } }, "Neuen Schlüssel prüfen …") : null) }];
     leeren(main,
       pending.length ? h("div", { class: "karte" }, h("h2", {}, `Freizugebende Rechner (${pending.length})`),
-        h("p", { class: "leise klein-t" }, "Diese Rechner haben VERA-Connect installiert und warten. Nach der Freigabe holen sie sich ihre WireGuard-Konfiguration und verbinden sich."),
+        h("p", { class: "leise klein-t" }, "Diese Rechner haben VERA-Connect installiert und warten. Nach der Freigabe holen sie sich ihre WireGuard-Konfiguration und verbinden sich. Erkennt VERA die Hardware eines bekannten Rechners wieder (z. B. Windows neu installiert), steht „gleiche Hardware wie …“ dabei – dann besser „Umtragen“: Zugang, Tunnel und Sicherungen bleiben erhalten. Freigegeben wird nie automatisch."),
         tabelle(cols, pending, { klick: details })) : null,
       h("div", { class: "karte" }, h("h2", {}, "Rechner mit VERA-Connect"),
         h("p", { class: "leise klein-t" }, "Windows-Rechner holen sich ihre Konfiguration selbst, halten den Tunnel aufrecht und aktualisieren WireGuard. Von außen muss nur der Pfad /client/ erreichbar sein."),
