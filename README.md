@@ -54,7 +54,7 @@ Beim ersten Start steht der **Einrichtungs-Code** im Log (und in `/config/setup-
 
 ## In MIRA einbinden
 
-1. Ordner [`mira-plugin/vera/`](mira-plugin/vera) nach `/config/plugins/vera/` von MIRA kopieren.
+1. In MIRA unter *Plugins › Katalog* installieren (Plugin-Verzeichnis PIA) – oder den Ordner [`plugin_mira/`](plugin_mira) nach `/config/plugins/vera/` von MIRA kopieren.
 2. MIRA › Plugins › „Ordner neu einlesen“ → **Freigeben**.
 3. In MIRA auf **VERA** klicken: der Assistent sucht VERA im Netz (oder Adresse eingeben) und meldet sich einmal mit einem **VERA-Admin** an. VERA stellt MIRA einen eigenen Schlüssel aus – das Passwort wird nicht gespeichert.
 4. Danach stehen WireGuard, Firewalls, Benutzer und Protokoll in MIRA zur Verfügung – dieselben Seiten wie hier. Im VERA-Protokoll steht, welcher MIRA-Benutzer etwas geändert hat; widerrufen unter **Verbundene Apps**.
@@ -90,7 +90,7 @@ Technik: [SysriX-Verbindungsstandard](https://github.com/SysriX/mira_unraid/blob
 | `app/main.py`, `app/core.py` | Anmeldung, Firewalls, Benutzer, Protokoll, Kopplung mit Apps |
 | `app/clients.py` | Rechner mit VERA-Connect: `/client/…` (öffentlich, signiert, inkl. `/client/backup/…`) und `/api/clients` |
 | `connect/` | VERA-Connect für Windows (Dienst, Tray, Fenster `gui.py`, QR-Leser `qrdecode.py`, Konfiguration/Schlüssel/Sicherungs-Verschlüsselung `wgconf.py`, Ed25519); gebaut von `.github/workflows/connect-windows.yml` |
-| `mira-plugin/vera/` | Plugin für MIRA; nach Änderungen an der Oberfläche `python tools/build_mira_plugin.py` |
+| `plugin_mira/` | Plugin für MIRA (signiert); nach Änderungen an der Oberfläche `python tools/build_mira_plugin.py`, dann `py tools/mira_plugin.py pack plugin_mira --key …` |
 
 ```bash
 pip install -r requirements.txt

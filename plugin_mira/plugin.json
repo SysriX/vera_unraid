@@ -1,10 +1,13 @@
 {
+  "format": 1,
   "id": "vera",
   "name": "VERA",
   "title": "VPN Endpoint & Remote Access",
   "version": "1.3.1",
   "author": "SysriX",
   "description": "WireGuard auf der OPNsense: Zugänge, neue Geräte, Konfigurationen, Standortverbindungen – in MIRA wie direkt in VERA.",
+  "homepage": "https://github.com/SysriX/vera_unraid",
+  "mira_min": "0.6.0",
   "group": "Netzwerk",
   "icon": "icon.svg",
   "connect": {
