@@ -2,8 +2,10 @@
 """VERA-Connect – keeps the WireGuard tunnel of a Windows computer configured, connected and up to date.
 
     VERA-Connect-Setup.exe                                         install (asks for the address of VERA)
-    VERA-Connect-Setup.exe /S URL=https://<VERA_EXTERN> ENROLLKEY=vk_… UPDATEURL=https://<UPDATE_URL> [UPDATEKEY=…] [TUNNEL=…]
-    vera-connect.exe install --url … [--enroll-key …] [--update-url …] [--update-key …] [--tunnel …] [--silent]
+    VERA-Connect-Setup.exe /S URL=https://<VERA_EXTERN> ENROLLKEY=vk_… UPDATEURL=https://<UPDATE_URL> [UPDATEKEY=…] [UMAENROLL=uk_…] [TUNNEL=…]
+        UPDATEKEY = public signing key of UMA (pinned on first contact if empty), UMAENROLL = enrolment key of UMA
+        (approves this computer in UMA at once – without it the computer waits there for approval)
+    vera-connect.exe install --url … [--enroll-key …] [--update-url …] [--update-key …] [--uma-enroll …] [--tunnel …] [--silent]
     vera-connect.exe uninstall | status | version | configure | tray | gui
     vera-connect.exe run [--data DIR] [--simulate]              foreground (the service runs this); --simulate = no WireGuard changes
     vera-connect.exe tunnel list|import FILE|import-qr IMAGE|connect|disconnect|default|rename|delete …   (administrator)
@@ -57,7 +59,7 @@ import ed25519
 import netdetect
 import wgconf
 
-VERSION = "1.3.3"
+VERSION = "1.4.0"
 PROGRAM = "vera-connect"                         # key of the program in UMA
 APP = "VERA-Connect"
 SERVICE = "VeraConnect"
@@ -291,13 +293,19 @@ def machine_facts() -> dict:
                 "user": os.environ.get("USER", ""), "os": platform.platform()}
     c, o = powershell(r"""
 $p = Get-CimInstance Win32_ComputerSystemProduct; $b = Get-CimInstance Win32_BIOS; $cs = Get-CimInstance Win32_ComputerSystem
-$os = Get-CimInstance Win32_OperatingSystem
+$os = Get-CimInstance Win32_OperatingSystem; $bb = Get-CimInstance Win32_BaseBoard
 $g = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography').MachineGuid
+$disk = ''
+try { $sysd = (Get-Partition -DriveLetter $env:SystemDrive.Substring(0,1) -ErrorAction Stop).DiskNumber
+      $disk = (Get-PhysicalDisk | Where-Object DeviceId -eq "$sysd" | Select-Object -First 1).SerialNumber } catch {}
+$ek = ''
+try { $e = Get-TpmEndorsementKeyInfo -ErrorAction Stop; if ($e.PublicKey) { $ek = [BitConverter]::ToString(
+      [Security.Cryptography.SHA256]::Create().ComputeHash($e.PublicKey.RawData)).Replace('-','') } } catch {}
 $u = $cs.UserName
 if (-not $u) { $e = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
   if ($e) { $o = Invoke-CimMethod -InputObject $e -MethodName GetOwner; if ($o.User) { $u = "$($o.Domain)\$($o.User)" } } }
-[pscustomobject]@{uuid=$p.UUID; guid=$g; serial=$b.SerialNumber; hostname=$env:COMPUTERNAME; domain=$(if ($cs.PartOfDomain) { $cs.Domain } else { "" })
-  user=$u; os="$($os.Caption) $($os.Version)"} | ConvertTo-Json -Compress
+[pscustomobject]@{uuid=$p.UUID; guid=$g; serial=$b.SerialNumber; board_serial=$bb.SerialNumber; disk_serial=("$disk").Trim(); tpm_ek=$ek
+  hostname=$env:COMPUTERNAME; domain=$(if ($cs.PartOfDomain) { $cs.Domain } else { "" }); user=$u; os="$($os.Caption) $($os.Version)"} | ConvertTo-Json -Compress
 """, 120)
     try:
         return json.loads(o[o.index("{"):])
@@ -332,6 +340,16 @@ class Device:
         if time.time() - self.facts_at > 900:
             self.facts, self.facts_at = machine_facts(), time.time()
         return self.facts
+
+    key_storage = "dpapi" if WIN else "file"
+
+    def fingerprint(self) -> dict:
+        """Hardware values for the device identity ("Geräte-Ausweis") – VERA/UMA recognise the computer by them
+        (e.g. after a reinstall); they never replace the key as proof."""
+        f = self.refresh_facts()
+        return {"smbios_uuid": str(f.get("uuid") or ""), "board_serial": str(f.get("board_serial") or ""),
+                "disk_serial": str(f.get("disk_serial") or ""), "tpm_ek": str(f.get("tpm_ek") or ""),
+                "bios_serial": str(f.get("serial") or ""), "machine_guid": str(f.get("guid") or "")}
 
     def headers(self, method: str, path: str, body: bytes) -> dict:
         ts, nonce = str(int(time.time())), secrets.token_hex(16)
@@ -948,11 +966,25 @@ class Agent:
         r = request(self.dev, c["url"], "POST", "/client/enroll",
                     {"machine_id": self.dev.machine_id, "public_key": self.dev.public, "hostname": f.get("hostname"),
                      "domain": f.get("domain"), "user": f.get("user"), "os": f.get("os"), "version": VERSION,
-                     "enroll_key": c.get("enroll_key", "")})
+                     "enroll_key": c.get("enroll_key", ""), "fingerprint": self.dev.fingerprint(),
+                     "key_storage": self.dev.key_storage})
         self.state["enrolled"] = c["url"]
         self.keep()
+        self.keep_credential(r.get("credential"))
         log("Bei VERA angemeldet – Status:", r.get("status"))
         return r
+
+    def keep_credential(self, cred, name: str = "credential.json", issuer: str = "VERA") -> None:
+        """Ausweis (credential signed by VERA, or by UMA → uma-credential.json) in the data folder (only when it changed)."""
+        if not cred:
+            return
+        try:
+            d = json.loads(cred) if isinstance(cred, str) else cred
+        except ValueError:
+            return
+        if isinstance(d, dict) and d != load(name):
+            save(name, d)
+            log(f"Ausweis von {issuer} erhalten/erneuert")
 
     def poll(self) -> None:
         c = self.conf
@@ -963,15 +995,15 @@ class Agent:
         try:
             if self.state.get("enrolled") != c["url"]:
                 self.enroll()
+            body = {"config_hash": self.state.get("config_hash", ""), "report": self.report(), "events": self.events,
+                    "fingerprint": self.dev.fingerprint()}
             try:
-                r = request(self.dev, c["url"], "POST", "/client/poll",
-                            {"config_hash": self.state.get("config_hash", ""), "report": self.report(), "events": self.events})
+                r = request(self.dev, c["url"], "POST", "/client/poll", body)
             except HttpError as e:
-                if e.status != 404:
+                if e.status not in (401, 404):                     # 401: VERA does not know this key (yet) → enrol it
                     raise
                 self.enroll()
-                r = request(self.dev, c["url"], "POST", "/client/poll",
-                            {"config_hash": self.state.get("config_hash", ""), "report": self.report(), "events": self.events})
+                r = request(self.dev, c["url"], "POST", "/client/poll", body)
             self.events = []
             STATUS.pop("last_error", None)
             allow = bool(r.get("allow_disconnect", True))
@@ -982,8 +1014,12 @@ class Agent:
             self.learn_instance(c["url"])
             self.next_poll = time.time() + (POLL_MIN if os.environ.get("VC_FAST") else max(POLL_MIN, int(r.get("interval") or 60)))
             st = r.get("status")
+            if st == "approved":
+                self.keep_credential(r.get("credential"))
+            set_status(identity="pending_key" if st == "pending" and self.state.get("config") else "",
+                       identity_message=(r.get("message") or "") if st == "pending" else "")
             if st == "pending":
-                set_status(state="pending", message="wartet auf Freigabe in VERA")
+                set_status(state="pending", message=r.get("message") or "wartet auf Freigabe in VERA")
             elif st == "blocked":
                 if self.vera_name():
                     self.wg.remove_tunnel(self.vera_name())
@@ -1153,9 +1189,13 @@ class Agent:
                                                           "machine_id": self.dev.machine_id, "public_key": self.dev.public,
                                                           "hostname": f.get("hostname"), "domain": f.get("domain"),
                                                           "user": f.get("user"), "os": f.get("os"),
+                                                          "fingerprint": self.dev.fingerprint(), "key_storage": self.dev.key_storage,
+                                                          "enroll_key": c.get("uma_enroll_key", ""),
                                                           "components": {"wireguard": wgv} if wgv else {}})
         self.uma_wg = next((x for x in r.get("components") or [] if x.get("name") == "wireguard"), None)
-        set_status(update_state=r.get("status"), wg_source="UMA" if self.uma_wg else "Hersteller")
+        set_status(update_state=r.get("status"), wg_source="UMA" if self.uma_wg else "Hersteller",
+                   update_machine=r.get("machine") or "", update_key_state=r.get("key_state") or "")
+        self.keep_credential(r.get("credential"), "uma-credential.json", "UMA")
         return r
 
     def uma_fetch(self, item: dict, program: str) -> bytes:
@@ -1862,7 +1902,8 @@ def tray_autostart(on: bool) -> None:
 
 
 CONFIG_MARK = b"\nVERA-CONNECT-CONFIG:"
-CONFIG_KEYS = {"url": "URL", "update_url": "UPDATEURL", "update_key": "UPDATEKEY", "enroll_key": "ENROLLKEY", "tunnel": "TUNNEL"}
+CONFIG_KEYS = {"url": "URL", "update_url": "UPDATEURL", "update_key": "UPDATEKEY", "enroll_key": "ENROLLKEY", "tunnel": "TUNNEL",
+               "uma_enroll_key": "UMAENROLL"}
 
 
 def embedded_config() -> dict:
@@ -1893,7 +1934,7 @@ def parse_params(argv: list[str]) -> dict:
         elif "=" in a:
             k, v = a.split("=", 1)
             k = k.strip().lstrip("/-").upper()
-            if k in ("URL", "ENROLLKEY", "UPDATEURL", "UPDATEKEY", "TUNNEL"):
+            if k in ("URL", "ENROLLKEY", "UPDATEURL", "UPDATEKEY", "UMAENROLL", "TUNNEL"):
                 out[k] = v.strip().strip('"')
     return out
 
@@ -1945,7 +1986,7 @@ def install(p: dict) -> None:
     elif "update_url" not in conf and not silent:
         v = ask(APP, "Adresse des Update-Servers (UMA), z. B. https://update.<Domain>\nLeer = keine automatischen Updates von VERA-Connect.")
         conf["update_url"] = normalize_url(v or "")
-    for k, n in (("ENROLLKEY", "enroll_key"), ("UPDATEKEY", "update_key"), ("TUNNEL", "tunnel")):
+    for k, n in (("ENROLLKEY", "enroll_key"), ("UPDATEKEY", "update_key"), ("UMAENROLL", "uma_enroll_key"), ("TUNNEL", "tunnel")):
         if p.get(k):
             conf[n] = p[k]
     if conf.get("url", "").startswith("http://"):
@@ -2235,7 +2276,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=APP)
     sub = ap.add_subparsers(dest="cmd")
     i = sub.add_parser("install", help="installieren und als Dienst starten")
-    for n in ("url", "enroll-key", "update-url", "update-key", "tunnel"):
+    for n in ("url", "enroll-key", "update-url", "update-key", "uma-enroll", "tunnel"):
         i.add_argument("--" + n, default="")
     i.add_argument("--silent", action="store_true")
     r = sub.add_parser("run", help="im Vordergrund laufen")
@@ -2281,7 +2322,8 @@ def main() -> None:
         argv = ["uninstall"] + ["--silent" if x.upper() in ("/S", "/SILENT", "/QUIET") else x for x in argv[1:]]
     a = ap.parse_args(argv)
     if a.cmd == "install":
-        p = {"URL": a.url, "ENROLLKEY": a.enroll_key, "UPDATEURL": a.update_url, "UPDATEKEY": a.update_key, "TUNNEL": a.tunnel,
+        p = {"URL": a.url, "ENROLLKEY": a.enroll_key, "UPDATEURL": a.update_url, "UPDATEKEY": a.update_key, "UMAENROLL": a.uma_enroll,
+             "TUNNEL": a.tunnel,
              "silent": a.silent}
         install({k: v for k, v in p.items() if v})
         print(f"{APP} installiert.")

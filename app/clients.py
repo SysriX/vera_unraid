@@ -16,6 +16,16 @@ Every request carries
     X-Signature: base64 Ed25519 over "METHOD\\nPATH\\nTIME\\nNONCE\\nsha256hex(body)"
 On enroll the key comes in the body (proof of possession); afterwards VERA only accepts the key it pinned.
 
+Device identity ("Geräte-Ausweis", see identitaet/GERAETE-AUSWEIS.md – same scheme as BERTA):
+    fingerprint  hardware values (SMBIOS UUID, board/BIOS/disk serial, TPM EK hash, MachineGuid) – which computer,
+                 compared with tolerance, never a secret and never a reason to approve on its own
+    device key   the pinned Ed25519 key – the proof. A NEW key for a known machine id does not replace the pinned one:
+                 it waits as pending_key until an admin takes it over ("Schlüssel übernehmen"); the computer stays
+                 approved with its old key meanwhile. An unknown machine id with matching hardware becomes a new waiting
+                 entry with a suggestion ("gleiche Hardware wie …") – the admin can move the identity over ("Umtragen").
+    credential   record signed by this VERA (key, machine id, fingerprint hash) – issued on approval/takeover, sent in poll
+    revoked keys vera_revoked_key – replaced or blocked keys are refused with 403
+
 Admin endpoints under /api/clients (login or API token) – page "Rechner" in the UI.
 """
 from __future__ import annotations
@@ -69,6 +79,25 @@ class Client(Base):
     approved_by: Mapped[str] = mapped_column(String(128), default="")
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     history: Mapped[list] = mapped_column(JSON, default=list)               # last events (max 30)
+    fingerprint: Mapped[str] = mapped_column(Text, default="")               # JSON of cleaned hardware values
+    key_storage: Mapped[str] = mapped_column(String(12), default="")         # dpapi | tpm
+    credential: Mapped[str] = mapped_column(Text, default="")                # JSON {credential, signature, signer}
+    credential_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pending_key: Mapped[str] = mapped_column(String(64), default="")         # new key of this machine id, waits for takeover
+    pending_fp: Mapped[str] = mapped_column(Text, default="")
+    pending_storage: Mapped[str] = mapped_column(String(12), default="")
+    pending_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    suggested_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # waiting entry: same hardware as this computer
+    match_quality: Mapped[str] = mapped_column(String(12), default="")        # same | partial
+
+
+class RevokedKey(Base):
+    __tablename__ = "vera_revoked_key"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    public_key: Mapped[str] = mapped_column(String(64), index=True)
+    client_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason: Mapped[str] = mapped_column(String(255), default="")
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class Backup(Base):
@@ -132,6 +161,116 @@ def set_setting(key: str, value: str) -> None:
         s.merge(x)
 
 
+# ------------------------------------------------------------------ device identity (fingerprint, credential, revocation)
+STRONG = ("smbios_uuid", "board_serial", "disk_serial", "tpm_ek")
+WEAK = ("bios_serial", "machine_guid")
+JUNK = {"", "0", "none", "null", "n/a", "na", "default string", "to be filled by o.e.m.", "to be filled by oem", "system serial number",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff", "00000000-0000-0000-0000-000000000000", "03000200-0400-0500-0006-000700080009",
+        "not applicable", "not specified", "123456789", "chassis serial number", "base board serial number"}
+FP_LABELS = {"smbios_uuid": "SMBIOS-UUID", "board_serial": "Mainboard-Seriennummer", "disk_serial": "Seriennummer Systemplatte",
+             "tpm_ek": "TPM (EK-Hash)", "bios_serial": "BIOS-Seriennummer", "machine_guid": "Windows-MachineGuid"}
+
+
+def clean(fp: dict) -> dict:
+    out = {}
+    for k in STRONG + WEAK:
+        v = str((fp or {}).get(k) or "").strip()
+        if v.lower() not in JUNK and len(v) >= 4 and len(set(v.replace("-", ""))) > 1:
+            out[k] = v.upper()
+    return out
+
+
+def compare(a: dict, b: dict) -> str:
+    """same | partial | different (a, b already cleaned)."""
+    agree = sum(1 for k in STRONG if k in a and k in b and a[k] == b[k])
+    clash = sum(1 for k in STRONG if k in a and k in b and a[k] != b[k])
+    weak_agree = sum(1 for k in WEAK if k in a and k in b and a[k] == b[k])
+    if agree >= 2 and clash == 0:
+        return "same"
+    if (agree >= 2 and clash == 1) or (agree == 1 and clash == 0 and weak_agree >= 1):
+        return "partial"
+    return "different"
+
+
+def _fp(raw: str) -> dict:
+    try:
+        v = json.loads(raw or "{}")
+        return v if isinstance(v, dict) else {}
+    except ValueError:
+        return {}
+
+
+def best_match(s, fp: dict, exclude_id: int | None = None):
+    """Known (not waiting) computer with the same hardware → (client, "same"|"partial") or (None, "different")."""
+    if not fp:
+        return None, "different"
+    best, quality = None, "different"
+    for c in s.scalars(select(Client).where(Client.status != "pending")):
+        if c.id == exclude_id:
+            continue
+        q = compare(fp, _fp(c.fingerprint))
+        if q == "same":
+            return c, q
+        if q == "partial" and best is None:
+            best, quality = c, q
+    return best, quality
+
+
+def _canonical(d: dict) -> bytes:
+    return json.dumps(d, sort_keys=True, separators=(",", ":")).encode()
+
+
+_sign_lock = threading.Lock()
+_sign_cache: list = []
+
+
+def signing_key():
+    """Ed25519 key of this VERA that signs the credentials (encrypted with secret.key in vera_setting)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    with _sign_lock:
+        if _sign_cache:
+            return _sign_cache[0]
+        enc = setting("id_signing_key")
+        raw = base64.b64decode(core.decrypt(enc)) if enc else b""
+        if not raw:
+            k = Ed25519PrivateKey.generate()
+            raw = k.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+            set_setting("id_signing_key", core.encrypt(base64.b64encode(raw).decode()))
+        _sign_cache.append(Ed25519PrivateKey.from_private_bytes(raw))
+        return _sign_cache[0]
+
+
+def signing_public() -> str:
+    from cryptography.hazmat.primitives import serialization
+    return base64.b64encode(signing_key().public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+
+
+def issue_credential(c) -> str:
+    body = {"v": 1, "service": "vera", "issuer": core.instance_id(), "device_id": c.id, "machine_id": c.machine_id,
+            "public_key": c.public_key, "fingerprint": hashlib.sha256(_canonical(_fp(c.fingerprint))).hexdigest(),
+            "key_storage": c.key_storage or "", "issued": int(time.time())}
+    sig = base64.b64encode(signing_key().sign(_canonical(body))).decode()
+    c.credential = json.dumps({"credential": body, "signature": sig, "signer": signing_public()})
+    c.credential_at = now()
+    return c.credential
+
+
+def revoked(s, public_key: str) -> bool:
+    return bool(public_key) and s.scalar(select(RevokedKey.id).where(RevokedKey.public_key == public_key).limit(1)) is not None
+
+
+def revoke(s, c, reason: str, key: str | None = None) -> None:
+    k = key if key is not None else c.public_key
+    if k and not revoked(s, k):
+        s.add(RevokedKey(public_key=k, client_id=c.id, reason=reason[:255], at=now()))
+        s.flush()
+
+
+def key_fp(k: str) -> str:
+    return hashlib.sha256(_b64(k)).hexdigest()[:16] if k else ""
+
+
 # ------------------------------------------------------------------ signatures
 _nonces: dict[str, float] = {}
 _nonce_lock = threading.Lock()
@@ -180,6 +319,8 @@ def build_public_router(host) -> APIRouter:
     r = APIRouter()
 
     async def _client(req: Request) -> tuple[Client, bytes, dict]:
+        """Signed request of a known computer. With the pinned key: as is. With the waiting new key (pending_key):
+        the returned copy has status "pending" – it may poll, nothing else."""
         body = await req.body()
         mid = req.headers.get("x-device", "")
         with session() as s:
@@ -187,7 +328,18 @@ def build_public_router(host) -> APIRouter:
             if not c:
                 raise HTTPException(404, "Rechner unbekannt – bitte neu anmelden")
             s.expunge(c)
-        check_signature(req, body, c.public_key)
+        try:
+            check_signature(req, body, c.public_key)
+            used = c.public_key
+        except HTTPException:
+            if not c.pending_key:
+                raise
+            check_signature(req, body, c.pending_key)
+            used = c.pending_key
+            c.status, c.note, c.credential = "pending", "neuer Geräteschlüssel – wartet auf Übernahme in VERA", ""
+        with session() as s:
+            if revoked(s, used):
+                raise HTTPException(403, "Geräteschlüssel dieses Rechners wurde gesperrt – VERA-Connect neu anmelden")
         try:
             data = json.loads(body or b"{}")
         except ValueError as e:
@@ -211,32 +363,61 @@ def build_public_router(host) -> APIRouter:
             raise HTTPException(403, "Anmelde-Schlüssel fehlt oder stimmt nicht")
         ip = req.client.host if req.client else ""
         info = {k: str(d.get(k) or "")[:128] for k in ("hostname", "domain", "user", "os", "version")}
+        fp = clean(d.get("fingerprint") if isinstance(d.get("fingerprint"), dict) else {})
+        storage = re.sub(r"[^a-z0-9]", "", str(d.get("key_storage") or "dpapi").lower())[:12] or "dpapi"
+        event, credential = "", ""
         with session() as s:
+            if revoked(s, pub):
+                raise HTTPException(403, "Dieser Geräteschlüssel wurde gesperrt – VERA-Connect neu installieren")
             c = s.scalar(select(Client).where(Client.machine_id == mid))
-            new = c is None
-            if new:
-                c = Client(machine_id=mid, public_key=pub, status="pending")
+            if c is None:
+                match, quality = best_match(s, fp)
+                c = Client(machine_id=mid, public_key=pub, status="pending", fingerprint=json.dumps(fp), key_storage=storage,
+                           suggested_id=match.id if match else None, match_quality=quality if match else "")
                 s.add(c)
-                _hist(c, "angemeldet – wartet auf Freigabe")
-            elif c.public_key != pub:                                 # cloned disk / reinstalled Windows
-                c.public_key = pub
-                if c.status == "approved":
-                    c.status, c.note = "pending", "Geräteschlüssel geändert – bitte prüfen und neu freigeben"
-                _hist(c, "neuer Geräteschlüssel")
+                like = f"gleiche Hardware wie {match.hostname or match.machine_id[:12]}" if match else ""
+                _hist(c, "angemeldet – wartet auf Freigabe" + (f" ({like})" if like else ""))
+                event = "VERA-Connect: Rechner angemeldet" + (f" – {like}" if like else "")
+                status = "pending"
+            elif c.public_key == pub:
+                if fp:
+                    old = _fp(c.fingerprint)
+                    if old and compare(fp, old) == "different":
+                        _hist(c, "Hardware-Werte weichen stark ab – bitte prüfen")
+                        c.note = "Hardware-Werte weichen vom bekannten Stand ab"
+                    else:
+                        c.fingerprint = json.dumps(fp)
+                c.key_storage = storage
+                if c.status == "approved" and not c.credential:
+                    issue_credential(c)
+                status = c.status
+                credential = c.credential if c.status == "approved" else ""
+            elif c.status == "pending":                              # never approved: nothing to protect, take the new key
+                c.public_key, c.fingerprint, c.key_storage = pub, json.dumps(fp), storage
+                _hist(c, "neuer Geräteschlüssel (noch nicht freigegeben)")
+                status = "pending"
+            else:                                                    # approved/blocked: the pinned key stays, the new one waits
+                if c.pending_key != pub:
+                    c.pending_key, c.pending_fp, c.pending_storage, c.pending_since = pub, json.dumps(fp), storage, now()
+                    _hist(c, "neuer Geräteschlüssel – wartet auf Übernahme")
+                    event = "VERA-Connect: neuer Geräteschlüssel wartet"
+                status = "pending"
             c.hostname, c.domain, c.username, c.os, c.client_version = (info["hostname"], info["domain"], info["user"],
                                                                          info["os"], info["version"])
             c.last_seen, c.last_ip = now(), ip
-            status = c.status
-        if new:
-            core.audit(info["hostname"] or mid[:12], "VERA-Connect: Rechner angemeldet", info["user"], ip=ip)
-        return {"status": status, "interval": POLL_PENDING if status != "approved" else POLL_APPROVED}
+        if event:
+            core.audit(info["hostname"] or mid[:12], event, info["user"], ip=ip)
+        return {"status": status, "interval": POLL_PENDING if status != "approved" else POLL_APPROVED, "credential": credential}
 
     @r.post("/client/poll")
     async def poll(req: Request):
         c, _, d = await _client(req)
         rep = d.get("report") or {}
         out = {"status": c.status, "interval": POLL_APPROVED if c.status == "approved" else POLL_PENDING,
-               "allow_disconnect": setting("allow_disconnect", "1") == "1", "backup": True}
+               "allow_disconnect": setting("allow_disconnect", "1") == "1", "backup": True,
+               "credential": c.credential if c.status == "approved" else ""}
+        if c.status == "pending" and c.note:
+            out["message"] = c.note
         cfg = None
         if c.status == "approved" and c.peer_id and c.firewall_id:
             try:
@@ -257,6 +438,17 @@ def build_public_router(host) -> APIRouter:
                         setattr(x, attr, str(rep[k])[:128])
             if d.get("config_hash") is not None:
                 x.config_hash = str(d.get("config_hash") or "")[:64]
+            fp = clean(d.get("fingerprint") if isinstance(d.get("fingerprint"), dict) else {})
+            if fp and c.status == "approved" and x.public_key == c.public_key:
+                old = _fp(x.fingerprint)
+                if old and compare(fp, old) == "different":
+                    if not x.note:
+                        _hist(x, "Hardware-Werte weichen stark ab – bitte prüfen")
+                    x.note = "Hardware-Werte weichen vom bekannten Stand ab"
+                else:
+                    x.fingerprint = json.dumps(fp)
+            if c.status == "approved" and not x.credential:
+                out["credential"] = issue_credential(x)
             for ev in (d.get("events") or [])[:10]:
                 _hist(x, str(ev)[:200])
         return out
@@ -368,7 +560,13 @@ def client_dict(c: Client, peers: dict | None = None) -> dict:
             "first_seen": c.first_seen.isoformat() if c.first_seen else None,
             "last_seen": c.last_seen.isoformat() if c.last_seen else None, "last_ip": c.last_ip,
             "approved_by": c.approved_by, "approved_at": c.approved_at.isoformat() if c.approved_at else None,
-            "history": list(reversed(c.history or []))}
+            "history": list(reversed(c.history or [])),
+            "fingerprint": _fp(c.fingerprint), "key_storage": c.key_storage or "",
+            "credential_at": c.credential_at.isoformat() if c.credential_at else None,
+            "pending_key": key_fp(c.pending_key), "pending_storage": c.pending_storage or "",
+            "pending_since": c.pending_since.isoformat() if c.pending_since else None,
+            "pending_fp": _fp(c.pending_fp), "pending_match": compare(_fp(c.pending_fp), _fp(c.fingerprint)) if c.pending_key else "",
+            "suggested_id": c.suggested_id, "match_quality": c.match_quality or ""}
 
 
 def build_admin_router(host, store) -> APIRouter:
@@ -386,11 +584,15 @@ def build_admin_router(host, store) -> APIRouter:
         peers = _peers()
         with session() as s:
             counts = dict(s.execute(select(Backup.client_id, func.count(Backup.id)).group_by(Backup.client_id)).all())
-            rows = [client_dict(c, peers) | {"backups": counts.get(c.id, 0)}
-                    for c in s.scalars(select(Client).order_by(Client.status != "pending", Client.hostname))]
+            all_c = list(s.scalars(select(Client).order_by(Client.status != "pending", Client.hostname)))
+            names = {c.id: c.hostname or c.machine_id[:12] for c in all_c}
+            rk = set(s.scalars(select(RevokedKey.public_key)))
+            rows = [client_dict(c, peers) | {"backups": counts.get(c.id, 0), "suggested_name": names.get(c.suggested_id, ""),
+                                             "key_revoked": c.public_key in rk}
+                    for c in all_c]
         return {"clients": rows, "enroll_key": setting("enroll_key") if u["level"] == "admin" else None,
                 "enroll_key_set": bool(setting("enroll_key")), "allow_disconnect": setting("allow_disconnect", "1") == "1",
-                "backup_keep": backup_keep()}
+                "backup_keep": backup_keep(), "fp_labels": FP_LABELS, "signer": signing_public()}
 
     @r.get("/{cid}/backups")
     def client_backups(cid: int, u=Depends(read)):
@@ -439,6 +641,8 @@ def build_admin_router(host, store) -> APIRouter:
             c = s.get(Client, cid)
             if not c:
                 raise HTTPException(404, "Rechner nicht gefunden")
+            if revoked(s, c.public_key):
+                raise HTTPException(409, "Der Geräteschlüssel dieses Rechners ist gesperrt – erst einen neuen Schlüssel übernehmen")
             hostname, user = c.hostname, c.username
         svc = host.service(fid)
         try:
@@ -462,22 +666,109 @@ def build_admin_router(host, store) -> APIRouter:
             c = s.get(Client, cid)
             c.status, c.note, c.firewall_id, c.peer_id, c.tunnel = "approved", "", fid, pid, tn
             c.approved_by, c.approved_at = u["name"], now()
-            _hist(c, f"freigegeben von {u['name']}")
+            c.suggested_id, c.match_quality = None, ""
+            issue_credential(c)
+            _hist(c, f"freigegeben von {u['name']} – Ausweis ausgestellt")
             res = client_dict(c, _peers())
         host.audit(u, "VERA-Connect: Rechner freigegeben", res["hostname"], details=f"Zugang {res['peer_name']} · Tunnel {tn}")
         return res
 
     @r.post("/{cid}/block")
-    def block(cid: int, u=Depends(admin)):
+    async def block(cid: int, req: Request, u=Depends(admin)):
+        """revoke=true: the device key goes onto the revocation list as well – the computer has to enrol with a new key
+        (VERA-Connect reinstalled), an admin takes that key over and approves again."""
+        try:
+            d = json.loads(await req.body() or b"{}")
+        except ValueError:
+            d = {}
+        rev = bool(isinstance(d, dict) and d.get("revoke"))
         with session() as s:
             c = s.get(Client, cid)
             if not c:
                 raise HTTPException(404, "Rechner nicht gefunden")
             c.status = "blocked"
-            _hist(c, f"gesperrt von {u['name']}")
+            if rev:
+                revoke(s, c, f"gesperrt von {u['name']}")
+                c.credential, c.credential_at = "", None
+            _hist(c, f"gesperrt von {u['name']}" + (" – Geräteschlüssel gesperrt" if rev else ""))
             name = c.hostname
-        host.audit(u, "VERA-Connect: Rechner gesperrt", name)
+        host.audit(u, "VERA-Connect: Rechner gesperrt", name, details="Geräteschlüssel gesperrt" if rev else "")
         return {"ok": True}
+
+    @r.post("/{cid}/accept_key")
+    def accept_key(cid: int, u=Depends(admin)):
+        """The new key of this machine id (pending_key) replaces the pinned one; the old key is revoked."""
+        with session() as s:
+            c = s.get(Client, cid)
+            if not c:
+                raise HTTPException(404, "Rechner nicht gefunden")
+            if not c.pending_key:
+                raise HTTPException(400, "Es wartet kein neuer Geräteschlüssel")
+            if revoked(s, c.pending_key):
+                raise HTTPException(409, "Der neue Schlüssel ist gesperrt")
+            revoke(s, c, f"ersetzt durch neuen Schlüssel ({u['name']})")
+            c.public_key, c.key_storage = c.pending_key, c.pending_storage or c.key_storage
+            if _fp(c.pending_fp):
+                c.fingerprint = c.pending_fp
+            c.pending_key, c.pending_fp, c.pending_storage, c.pending_since, c.note = "", "", "", None, ""
+            c.credential, c.credential_at = "", None
+            if c.status == "approved":
+                issue_credential(c)
+            _hist(c, f"neuen Geräteschlüssel übernommen ({u['name']})")
+            name = c.hostname
+            res = client_dict(c, _peers())
+        host.audit(u, "VERA-Connect: Geräteschlüssel übernommen", name)
+        return res
+
+    @r.post("/{cid}/discard_key")
+    def discard_key(cid: int, u=Depends(admin)):
+        """Refuse the waiting new key (it goes onto the revocation list)."""
+        with session() as s:
+            c = s.get(Client, cid)
+            if not c or not c.pending_key:
+                raise HTTPException(404, "Es wartet kein neuer Geräteschlüssel")
+            revoke(s, c, f"neuer Schlüssel abgelehnt ({u['name']})", key=c.pending_key)
+            c.pending_key, c.pending_fp, c.pending_storage, c.pending_since = "", "", "", None
+            _hist(c, f"neuen Geräteschlüssel abgelehnt ({u['name']})")
+            name = c.hostname
+        host.audit(u, "VERA-Connect: neuer Geräteschlüssel abgelehnt", name)
+        return {"ok": True}
+
+    @r.post("/{cid}/replace")
+    async def replace(cid: int, req: Request, u=Depends(admin)):
+        """Umtragen: the waiting entry cid (new hardware / reinstalled Windows) takes over the identity of target –
+        WireGuard access, tunnel, backups and history stay at target; the old key of target is revoked."""
+        target = int((await req.json()).get("target") or 0)
+        with session() as s:
+            new, old = s.get(Client, cid), s.get(Client, target)
+            if not new or not old or new.id == old.id:
+                raise HTTPException(404, "Rechner nicht gefunden")
+            if new.status != "pending" or old.status == "pending":
+                raise HTTPException(400, "Umtragen nur von einem wartenden auf einen bekannten Rechner")
+            if revoked(s, new.public_key):
+                raise HTTPException(409, "Der Schlüssel des wartenden Rechners ist gesperrt")
+            revoke(s, old, f"ersetzt durch {new.hostname or new.machine_id[:12]} ({u['name']})")
+            if old.pending_key:
+                revoke(s, old, "verworfen beim Umtragen", key=old.pending_key)
+            vals = {f: getattr(new, f) for f in ("machine_id", "public_key", "key_storage", "fingerprint", "hostname", "domain",
+                                                 "username", "os", "client_version", "last_seen", "last_ip")}
+            new_hist = list(new.history or [])
+            s.delete(new)
+            s.flush()                                               # machine_id is unique
+            for f, v in vals.items():
+                setattr(old, f, v)
+            old.pending_key, old.pending_fp, old.pending_storage, old.pending_since = "", "", "", None
+            old.suggested_id, old.match_quality, old.note = None, "", ""
+            old.status, old.approved_by, old.approved_at = "approved", u["name"], now()
+            old.config_hash = ""                                     # the new computer has nothing installed yet
+            old.history = (list(old.history or []) + new_hist[-5:])[-30:]
+            issue_credential(old)
+            _hist(old, f"umgetragen von {u['name']}: neuer Rechner/Schlüssel übernimmt diesen Eintrag")
+            for o in s.scalars(select(Client).where(Client.suggested_id == cid)):
+                o.suggested_id = old.id
+            res = client_dict(old, _peers())
+        host.audit(u, "VERA-Connect: Rechner umgetragen", res["hostname"], details=f"wartender Eintrag {cid} → Rechner {target}")
+        return res
 
     @r.delete("/{cid}")
     def remove(cid: int, u=Depends(admin)):
@@ -487,6 +778,8 @@ def build_admin_router(host, store) -> APIRouter:
                 raise HTTPException(404, "Rechner nicht gefunden")
             name = c.hostname
             s.delete(c)
+            for o in s.scalars(select(Client).where(Client.suggested_id == cid)):
+                o.suggested_id, o.match_quality = None, ""
             n = 0
             for b in s.scalars(select(Backup).where(Backup.client_id == cid)).all():
                 s.delete(b)
@@ -519,10 +812,10 @@ def build_admin_router(host, store) -> APIRouter:
     @r.put("/installer/settings")
     async def installer_settings_set(req: Request, u=Depends(admin)):
         d = await req.json()
-        for k in ("vera_url", "update_url", "update_key", "tunnel", "base_url"):
+        for k in ("vera_url", "update_url", "update_key", "uma_enroll_key", "tunnel", "base_url"):
             if k in d:
                 set_setting("installer_" + k, (d[k] or "").strip())
-        host.audit(u, "VERA-Connect: Installer-Einstellungen geändert", "", details=json.dumps({k: v for k, v in d.items() if k != "update_key"}))
+        host.audit(u, "VERA-Connect: Installer-Einstellungen geändert", "", details=json.dumps({k: v for k, v in d.items() if k not in ("update_key", "uma_enroll_key")}))
         return _installer_info(req)
 
     @r.post("/installer/refresh")
@@ -553,7 +846,7 @@ def build_admin_router(host, store) -> APIRouter:
             raise HTTPException(409, "Noch keine Grund-EXE – „Von GitHub laden“ oder eine EXE hochladen")
         info = _installer_info(req)
         cfg = {"url": info["vera_url"], "update_url": info["update_url"], "update_key": info["update_key"],
-               "enroll_key": setting("enroll_key"), "tunnel": info["tunnel"]}
+               "uma_enroll_key": info["uma_enroll_key"], "enroll_key": setting("enroll_key"), "tunnel": info["tunnel"]}
         cfg = {k: v for k, v in cfg.items() if v or k == "update_url"}
         if not cfg.get("url"):
             raise HTTPException(400, "Adresse von VERA fehlt")
@@ -615,5 +908,6 @@ def _installer_info(req: Request) -> dict:
         base = {}
     return {"vera_url": setting("installer_vera_url"), "suggest_vera_url": f"{proto}://{fwd}" if fwd else "",
             "update_url": setting("installer_update_url"), "update_key": setting("installer_update_key"),
+            "uma_enroll_key": setting("installer_uma_enroll_key"),
             "tunnel": setting("installer_tunnel"), "base_url": setting("installer_base_url") or BASE_EXE_URL,
             "base": base if os.path.exists(BASE_EXE) else None, "enroll_key_set": bool(setting("enroll_key"))}

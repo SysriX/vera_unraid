@@ -18,7 +18,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 DATA = os.environ.get("VERA_DATA", "/config")
 KEY_FILE = os.path.join(DATA, "secret.key")
 
@@ -166,8 +166,42 @@ def db_start():
         args["pool_recycle"] = 1800
     engine = create_engine(url, **args)
     Base.metadata.create_all(engine)
+    add_missing_columns(engine)
     _sm = sessionmaker(engine, expire_on_commit=False)
     log("Datenbank:", "MariaDB/MySQL" if url.startswith("mysql") else "SQLite")
+
+
+def add_missing_columns(engine) -> None:
+    """New columns of existing tables (newer VERA version) are added with their default – no manual migration needed."""
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import text as sa_text
+    insp = sa_inspect(engine)
+    tables = set(insp.get_table_names())
+    for t in Base.metadata.sorted_tables:
+        if t.name not in tables:
+            continue
+        have = {c["name"] for c in insp.get_columns(t.name)}
+        for col in t.columns:
+            if col.name in have or col.primary_key:
+                continue
+            typ = col.type.compile(dialect=engine.dialect)
+            default = col.default.arg if col.default is not None and not callable(col.default.arg) else None
+            if isinstance(default, bool):
+                lit = "1" if default else "0"
+            elif isinstance(default, (int, float)):
+                lit = str(default)
+            elif isinstance(default, str):
+                lit = "'" + default.replace("'", "''") + "'"
+            else:
+                lit = None
+            ddl = f"ALTER TABLE {t.name} ADD COLUMN {col.name} {typ}"
+            if lit is not None and not typ.upper().startswith(("TEXT", "BLOB", "JSON", "LONG")):
+                ddl += f" NOT NULL DEFAULT {lit}"
+            with engine.begin() as c:
+                c.execute(sa_text(ddl))
+                if lit is not None and typ.upper().startswith(("TEXT", "JSON")):
+                    c.execute(sa_text(f"UPDATE {t.name} SET {col.name} = {lit}"))
+            log(f"Datenbank: Spalte {t.name}.{col.name} ergänzt")
 
 
 @contextmanager

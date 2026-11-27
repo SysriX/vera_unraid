@@ -6,6 +6,8 @@
 
 `ghcr.io/sysrix/vera:latest`
 
+> **Stand 1.4.0:** Geräte-Ausweis für VERA-Connect (wie BERTA): Hardware-Fingerabdruck (SMBIOS-UUID, Mainboard-/BIOS-/Platten-Seriennummer, TPM-EK, MachineGuid), angehefteter Geräteschlüssel, von VERA signierter Ausweis, Sperrliste. Ein neuer Schlüssel derselben Rechner-Kennung wartet auf „Schlüssel übernehmen“ (der Rechner bleibt mit dem alten Schlüssel freigegeben); ein unbekannter Rechner mit gleicher Hardware wird als „gleiche Hardware wie …“ vorgeschlagen und kann **umgetragen** werden (Zugang, Tunnel, Sicherungen bleiben). Gleiche Hardware gibt nie automatisch frei. Braucht VERA-Connect 1.4.
+>
 > **Stand 1.3.1:** VERA-Connect 1.3 mit Heimnetz-Erkennung (Tunnel pausiert im eigenen Netz) – Zustand „im Heimnetz“ in den Rechner-Details.
 > **Stand 1.3.0:** Sicherungen von VERA-Connect 1.2 (verschlüsselt auf dem Rechner, Versionsliste, Übertragen auf einen anderen Rechner), eigene Tunnel der Rechner in den Details sichtbar.
 > **Stand 1.2.0:** Windows-Client **VERA-Connect** und Seite „Rechner“ (Freigabe) – Ablauf getestet, WireGuard dabei simuliert; die EXE wird bei GitHub auf frischem Windows mit echtem WireGuard getestet.
